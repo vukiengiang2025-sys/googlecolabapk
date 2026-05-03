@@ -34,11 +34,6 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import { GoogleGenAI } from "@google/genai";
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
-if (!process.env.GEMINI_API_KEY) {
-  console.warn("CẢNH BÁO: Thiếu GEMINI_API_KEY. Vui lòng thiết lập biến môi trường này.");
-}
-
 const ELITE_SNIPPETS = [
   {
     id: 'idempotent-guard',
@@ -200,6 +195,19 @@ const SCHEDULER_CONFIG = {
 const SMOOTHING_ALPHA = 0.3;
 
 export default function App() {
+  const [userApiKey, setUserApiKey] = useState(() => localStorage.getItem('gemini_api_key') || "");
+
+  const ai = useMemo(() => {
+    const key = userApiKey || process.env.GEMINI_API_KEY || "";
+    return new GoogleGenAI(key);
+  }, [userApiKey]);
+
+  useEffect(() => {
+    if (!userApiKey && !process.env.GEMINI_API_KEY) {
+      console.warn("CẢNH BÁO: Thiếu GEMINI_API_KEY. Vui lòng thiết lập biến môi trường hoặc nhập key trong tab Hệ thống.");
+    }
+  }, [userApiKey]);
+
   const [activeTab, setActiveTab] = useState<'hub' | 'forge' | 'library' | 'system'>('hub');
   const [showOrbital, setShowOrbital] = useState(false);
   const [notifications, setNotifications] = useState<OSNotification[]>([]);
@@ -999,6 +1007,29 @@ export default function App() {
                       <StateRow label="TÍNH TOÁN CPU" val={`${(session.cpuLoad ?? 0).toFixed(0)}%`} color={(session.cpuLoad ?? 0) > 85 ? 'text-orange-500' : 'text-brand-primary'} />
                       <StateRow label="NHIỆT ĐỘ" val={`${(session.temp ?? 0).toFixed(1)}°C`} color={(session.temp ?? 0) > 80 ? 'text-red-500' : 'text-indigo-400'} />
                       <StateRow label="ĐỘ TRỄ MẠNG" val={`${(session.latency ?? 0).toFixed(0)}ms`} color="text-emerald-500" />
+                   </div>
+
+                   <div className="pt-6 md:pt-12 border-t border-white/10 space-y-6 md:space-y-10">
+                      <label className="text-[9px] md:text-[11px] font-black uppercase tracking-[0.2em] md:tracking-[0.3em] text-slate-700 block text-brand-primary">Lưu trữ API Key</label>
+                      <div className="relative group">
+                        <input 
+                          type="password"
+                          value={userApiKey}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setUserApiKey(val);
+                            localStorage.setItem('gemini_api_key', val);
+                          }}
+                          placeholder="Nhập Gemini API Key tại đây..."
+                          className="w-full bg-white/5 border border-white/10 rounded-2xl py-4 px-6 text-[11px] md:text-[13px] text-white placeholder:text-slate-700 focus:border-brand-primary/50 focus:outline-none transition-all pr-12"
+                        />
+                        <div className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-700 group-focus-within:text-brand-primary transition-colors">
+                          <Zap className="w-4 h-4 md:w-5 md:h-5" />
+                        </div>
+                      </div>
+                      <p className="text-[8px] md:text-[9px] text-slate-600 font-bold leading-relaxed">
+                        * Key được lưu cục bộ trong trình duyệt. Hệ thống sẽ ưu tiên key này hơn biến môi trường.
+                      </p>
                    </div>
 
                    <div className="pt-6 md:pt-12 border-t border-white/10 space-y-6 md:space-y-10">
