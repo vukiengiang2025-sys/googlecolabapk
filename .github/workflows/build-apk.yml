@@ -42,10 +42,16 @@ jobs:
         with:
           gradle-version: '8.14.3'
 
+      - name: Regenerate Gradle Wrapper
+        run: |
+          cd android
+          gradle wrapper --gradle-version 8.14.3
+
       - name: Build APK (Debug)
         run: |
           cd android
-          gradle assembleDebug --stacktrace
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
