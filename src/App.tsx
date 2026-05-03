@@ -198,12 +198,19 @@ export default function App() {
   const [userApiKey, setUserApiKey] = useState(() => localStorage.getItem('gemini_api_key') || "");
 
   const ai = useMemo(() => {
-    const key = userApiKey || process.env.GEMINI_API_KEY || "";
-    return new GoogleGenAI(key);
+    const key = (userApiKey || (typeof process !== 'undefined' ? process.env?.GEMINI_API_KEY : '') || "").trim();
+    if (!key || key === "MY_GEMINI_API_KEY") return null;
+    try {
+      return new GoogleGenAI({ apiKey: key });
+    } catch (e) {
+      console.error("Neural initialization failed:", e);
+      return null;
+    }
   }, [userApiKey]);
 
   useEffect(() => {
-    if (!userApiKey && !process.env.GEMINI_API_KEY) {
+    const envKey = typeof process !== 'undefined' ? process.env?.GEMINI_API_KEY : '';
+    if (!userApiKey && (!envKey || envKey === "MY_GEMINI_API_KEY")) {
       console.warn("CẢNH BÁO: Thiếu GEMINI_API_KEY. Vui lòng thiết lập biến môi trường hoặc nhập key trong tab Hệ thống.");
     }
   }, [userApiKey]);
@@ -754,14 +761,22 @@ export default function App() {
     const startTime = Date.now();
     addLog('TRÌNH_BIÊN_DỊCH: Đang dệt các hướng dẫn thần kinh thích ứng...', 'BỘ_NÃO');
     
+    if (!ai) {
+      triggerNotification("Thiếu API Key. Vui lòng nhập Key trong tab Hệ thống.", "ERROR");
+      vibrate(HAPTIC.ERROR);
+      setIsGenerating(false);
+      return;
+    }
+
     try {
-      const result = await ai.models.generateContent({
-        model: "gemini-1.5-flash",
+      const model = ai.getGenerativeModel({ model: "gemini-1.5-flash" });
+      const result = await model.generateContent({
         contents: [{ role: 'user', parts: [{ text: `Thiết kế một script Python AI Tự hành & Liên bang cho: ${prompt}. CHỈ XUẤT MÃ NGUỒN THUẦN.` }] }],
       });
       
+      const response = await result.response;
       const latency = Date.now() - startTime;
-      const code = result.text?.replace(/```[a-z]*\n|```/g, '') || "";
+      const code = response.text().replace(/```[a-z]*\n|```/g, '') || "";
       
       setLatencyHistory(prev => {
         const next = [latency, ...prev].slice(0, SCHEDULER_CONFIG.NETWORK.WINDOW_SIZE);
