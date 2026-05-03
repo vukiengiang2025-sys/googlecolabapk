@@ -29,10 +29,34 @@ import {
   Hand,
   CheckCircle,
   XCircle,
-  Check
+  Check,
+  LogOut,
+  LogIn,
+  User
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { GoogleGenAI } from "@google/genai";
+import { 
+  auth, 
+  db, 
+  googleProvider, 
+  signInWithPopup, 
+  signOut, 
+  collection, 
+  query, 
+  where, 
+  orderBy, 
+  onSnapshot, 
+  doc, 
+  setDoc, 
+  updateDoc, 
+  deleteDoc, 
+  serverTimestamp,
+  handleFirestoreError,
+  OperationType,
+  testConnection
+} from './lib/firebase';
+import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
 
 const ELITE_SNIPPETS = [
   {
@@ -195,6 +219,34 @@ const SCHEDULER_CONFIG = {
 const SMOOTHING_ALPHA = 0.3;
 
 export default function App() {
+  const [currentUser, setCurrentUser] = useState<FirebaseUser | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+
+  useEffect(() => {
+    testConnection();
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setCurrentUser(user);
+      setAuthReady(true);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  const handleLogin = async () => {
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (error) {
+      console.error("Login failed:", error);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+    } catch (error) {
+      console.error("Logout failed:", error);
+    }
+  };
+
   const [userApiKey, setUserApiKey] = useState(() => localStorage.getItem('gemini_api_key') || "");
 
   const ai = useMemo(() => {
@@ -268,30 +320,79 @@ export default function App() {
     localStorage.setItem('elite_neural_cache', JSON.stringify(neuralCache));
   }, [neuralCache]);
   
-  const [logs, setLogs] = useState<LogEntry[]>(() => {
-    try {
-      const saved = localStorage.getItem('elite_logs');
-      return saved ? JSON.parse(saved) : [
-        { timestamp: new Date().toLocaleTimeString(), level: 'NHÂN', msg: 'Nhân hệ thống v6.8.2 đã kích hoạt. Bảo vệ bộ nhớ đang hoạt động.' },
-        { timestamp: new Date().toLocaleTimeString(), level: 'BỘ_NÃO', msg: 'Elite OS v6.0 Bộ não Tự hành đã khởi tạo.' }
-      ];
-    } catch {
-      return [];
-    }
-  });
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [queue, setQueue] = useState<Job[]>([]);
 
-  const [queue, setQueue] = useState<Job[]>(() => {
-    try {
-      const saved = localStorage.getItem('elite_queue');
-      return saved ? JSON.parse(saved) : [
-        { id: 'J-601', name: 'Chưng cất Mô hình Toàn cầu', requirements: { vram: 40, priority: 'KHẨN_CẤP', latency: 'LÔ' }, status: 'XẾP_HÀNG', executor: 'ĐANG_CHỜ', estCost: '0.00$', retries: 0 },
-        { id: 'J-602', name: 'Suy luận Thời gian thực', requirements: { vram: 4, priority: 'CAO', latency: 'THỜI_GIAN_THỰC' }, status: 'XẾP_HÀNG', executor: 'ĐANG_CHỜ', estCost: '0.00$', retries: 0 },
-        { id: 'J-603', name: 'Phân mảnh Dữ liệu', requirements: { vram: 8, priority: 'THẤP', latency: 'LÔ' }, status: 'THÀNH_CÔNG', executor: 'COLAB', estCost: '0.01$', retries: 0 }
-      ];
-    } catch {
-      return [];
+  // Sync Library/Snippets if needed, but I'll focus on Queue and Logs first
+  useEffect(() => {
+    if (!authReady || !currentUser) {
+      setQueue([]);
+      setLogs([]);
+      return;
     }
-  });
+
+    const qTasks = query(
+      collection(db, 'tasks'),
+      where('ownerId', '==', currentUser.uid),
+      orderBy('createdAt', 'desc')
+    );
+
+    const unsubscribeTasks = onSnapshot(qTasks, (snapshot) => {
+      const taskData: Job[] = [];
+      snapshot.forEach((doc) => {
+        taskData.push({ id: doc.id, ...doc.data() } as Job);
+      });
+      setQueue(taskData);
+    }, (error) => handleFirestoreError(error, OperationType.LIST, 'tasks'));
+
+    const qLogs = query(
+      collection(db, 'logs'),
+      where('ownerId', '==', currentUser.uid),
+      orderBy('timestamp', 'desc'),
+      limit(50)
+    );
+
+    const unsubscribeLogs = onSnapshot(qLogs, (snapshot) => {
+      const logData: LogEntry[] = [];
+      snapshot.forEach((doc) => {
+        logData.push(doc.data() as LogEntry);
+      });
+      setLogs(logData);
+    }, (error) => handleFirestoreError(error, OperationType.LIST, 'logs'));
+
+    return () => {
+      unsubscribeTasks();
+      unsubscribeLogs();
+    };
+  }, [authReady, currentUser]);
+
+  const [library, setLibrary] = useState<any[]>(ELITE_SNIPPETS);
+
+  // Sync Library/Snippets
+  useEffect(() => {
+    if (!authReady || !currentUser) {
+      setLibrary(ELITE_SNIPPETS);
+      return;
+    }
+
+    const qLibrary = query(
+      collection(db, 'library'),
+      orderBy('createdAt', 'desc')
+    );
+
+    const unsubscribeLibrary = onSnapshot(qLibrary, (snapshot) => {
+      const libData: any[] = [...ELITE_SNIPPETS];
+      snapshot.forEach((doc) => {
+        const snippet = { id: doc.id, ...doc.data() };
+        if (!libData.find(s => s.id === snippet.id)) {
+          libData.push(snippet);
+        }
+      });
+      setLibrary(libData);
+    }, (error) => handleFirestoreError(error, OperationType.LIST, 'library'));
+
+    return () => unsubscribeLibrary();
+  }, [authReady, currentUser]);
 
   const [latencyHistory, setLatencyHistory] = useState<number[]>([]);
   const [isThrottled, setIsThrottled] = useState(false);
@@ -431,9 +532,22 @@ export default function App() {
     return () => clearTimeout(timer);
   }, []);
 
-  const addLog = (msg: string, level: LogEntry['level'] = 'THÔNG_TIN', executor: string = 'BỘ_NÃO') => {
-    const entry: LogEntry = { timestamp: new Date().toLocaleTimeString(), level, msg, executor };
-    setLogs(prev => [entry, ...prev].slice(0, 50));
+  const addLog = async (msg: string, level: LogEntry['level'] = 'THÔNG_TIN', executor: string = 'BỘ_NÃO') => {
+    const timestamp = new Date().toLocaleTimeString();
+    if (currentUser) {
+      try {
+        const logRef = doc(collection(db, 'logs'));
+        await setDoc(logRef, {
+          timestamp: serverTimestamp(),
+          level,
+          msg,
+          executor,
+          ownerId: currentUser.uid
+        });
+      } catch (error) {
+        console.error("Log write failed:", error);
+      }
+    }
     
     if (level === 'LỖI' || level === 'NGHIÊM_TRỌNG') {
       triggerNotification(msg, 'ERROR');
@@ -572,7 +686,12 @@ export default function App() {
     }
   };
 
-  const pushToQueue = (taskName: string, config: { priority: JobRequirements['priority'], vram: number }) => {
+  const pushToQueue = async (taskName: string, config: { priority: JobRequirements['priority'], vram: number }) => {
+    if (!currentUser) {
+      triggerNotification("Vui lòng đăng nhập để thực hiện tác vụ.", "WARN");
+      return;
+    }
+    
     // Backpressure v6.5: Cảnh báo theo tầng
     const queuedCount = queue.filter(j => j.status === 'XẾP_HÀNG').length;
     const isSaturated = queuedCount >= 18;
@@ -588,7 +707,7 @@ export default function App() {
     const priorityBase = SCHEDULER_CONFIG.PRIORITY_WEIGHTS[config.priority];
     const cost = (config.vram * 1.5) + (priorityBase * 0.2) + contextEst;
 
-    const newJob: Job = {
+    const newJob: any = {
       id,
       name: taskName,
       status: 'XẾP_HÀNG',
@@ -597,123 +716,134 @@ export default function App() {
       estCost: `${(cost / 50).toFixed(2)}$`,
       retries: 0,
       cost,
-      waitTicks: 0
+      waitTicks: 0,
+      ownerId: currentUser.uid,
+      createdAt: serverTimestamp()
     };
     
-    setQueue(prev => [newJob, ...prev]);
-    
-    if (isCriticalSaturated) {
-      addLog(`QUÁ_TẢI_NGHIÊM_TRỌNG: Hàng chờ vượt ngưỡng an toàn. ETA: ${etaSeconds}s.`, 'NGHIÊM_TRỌNG', 'HỆ_THỐNG');
-      triggerNotification(`Hệ thống bão hòa: ETA ${etaSeconds}s`, 'ERROR');
-    } else if (isSaturated) {
-      addLog(`CẢNH_BÁO_ÁP_LỰC: Tải cao. Hàng chờ: ${queuedCount}. ETA dự kiến: ${etaSeconds}s.`, 'CẢNH_BÁO', 'HỆ_THỐNG');
-      triggerNotification(`Tải hệ thống cao: ETA ${etaSeconds}s`, 'WARN');
-    } else {
-      addLog(`ĐIỀU_PHỐI: Tác vụ ${id} đã đăng ký. Độ phức tạp: ${cost.toFixed(0)} RU.`, 'THÔNG_TIN');
-      triggerNotification(`Đã xếp hàng: ${id}`, 'INFO');
+    try {
+      await setDoc(doc(db, 'tasks', id), newJob);
+      
+      if (isCriticalSaturated) {
+        addLog(`QUÁ_TẢI_NGHIÊM_TRỌNG: Hàng chờ vượt ngưỡng an toàn. ETA: ${etaSeconds}s.`, 'NGHIÊM_TRỌNG', 'HỆ_THỐNG');
+        triggerNotification(`Hệ thống bão hòa: ETA ${etaSeconds}s`, 'ERROR');
+      } else if (isSaturated) {
+        addLog(`CẢNH_BÁO_ÁP_LỰC: Tải cao. Hàng chờ: ${queuedCount}. ETA dự kiến: ${etaSeconds}s.`, 'CẢNH_BÁO', 'HỆ_THỐNG');
+        triggerNotification(`Tải hệ thống cao: ETA ${etaSeconds}s`, 'WARN');
+      } else {
+        addLog(`ĐIỀU_PHỐI: Tác vụ ${id} đã đăng ký. Độ phức tạp: ${cost.toFixed(0)} RU.`, 'THÔNG_TIN');
+        triggerNotification(`Đã xếp hàng: ${id}`, 'INFO');
+      }
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, `tasks/${id}`);
     }
   };
 
-  const handlePipeline = (id: string) => {
-    setQueue(prev => {
-      const job = prev.find(j => j.id === id);
-      if (!job || job.status !== 'XẾP_HÀNG') return prev;
+  const handlePipeline = async (id: string) => {
+    const job = queue.find(j => j.id === id);
+    if (!job || job.status !== 'XẾP_HÀNG') return;
 
-      addLog(`ĐIỀU_PHỐI: Đang phân bổ tài nguyên cho ${id}...`, 'BỘ_NÃO');
+    addLog(`ĐIỀU_PHỐI: Đang phân bổ tài nguyên cho ${id}...`, 'BỘ_NÃO');
+    
+    try {
+      await updateDoc(doc(db, 'tasks', id), { status: 'ĐANG_ĐIỀU_PHỐI' });
       
-      setTimeout(() => {
-        setQueue(q => {
-          const currentJob = q.find(j => j.id === id);
-          if (!currentJob) return q;
+      setTimeout(async () => {
+        let selectedNode: Job['executor'] = 'COLAB';
+        let costLabel = '0.02$';
+        const nodeId = `NODE-${selectedNode}-${Math.floor(Math.random() * 99)}`;
 
-          let selectedNode: Job['executor'] = 'COLAB';
-          let cost = '0.02$';
-          const nodeId = `NODE-${selectedNode}-${Math.floor(Math.random() * 99)}`;
+        if (job.requirements.vram > 16 || job.requirements.priority === 'KHẨN_CẤP') {
+          selectedNode = 'REMOTE';
+          costLabel = '1.25$';
+        }
 
-          if (currentJob.requirements.vram > 16 || currentJob.requirements.priority === 'KHẨN_CẤP') {
-            selectedNode = 'REMOTE';
-            cost = '1.25$';
-          }
-
-          addLog(`QUYẾT_ĐỊNH: Điều hướng ${id} tới cụm ${selectedNode}. NodeID: ${nodeId}`, 'BỘ_NÃO');
-          executeJob(id, selectedNode, nodeId);
-          return q.map(j => j.id === id ? { ...j, executor: selectedNode, status: 'ĐANG_CÔ_LẬP', estCost: cost, metrics: { throughput: 'Đang tính...', nodeId, startTime: Date.now(), tokens: 0 } } : j);
+        addLog(`QUYẾT_ĐỊNH: Điều hướng ${id} tới cụm ${selectedNode}. NodeID: ${nodeId}`, 'BỘ_NÃO');
+        
+        await updateDoc(doc(db, 'tasks', id), { 
+          executor: selectedNode, 
+          status: 'ĐANG_CÔ_LẬP', 
+          estCost: costLabel, 
+          metrics: { 
+            throughput: 'Đang tính...', 
+            nodeId, 
+            startTime: Date.now(), 
+            tokens: 0 
+          } 
         });
-      }, 1500);
 
-      return prev.map(j => j.id === id ? { ...j, status: 'ĐANG_ĐIỀU_PHỐI' } : j);
-    });
+        executeJob(id, selectedNode, nodeId);
+      }, 1500);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, `tasks/${id}`);
+    }
   };
 
-  const addJob = () => {
+  const addJob = async () => {
     const names = ['Di cư Thần kinh', 'Định hình lại Trọng số', 'Tiêm Ngữ cảnh', 'Ổn định Lớp', 'Tinh chỉnh Hướng dẫn'];
     const priorities: JobRequirements['priority'][] = ['THẤP', 'TRUNG_BÌNH', 'CAO', 'KHẨN_CẤP'];
     
     const priority = priorities[Math.floor(Math.random() * priorities.length)];
     const vram = priority === 'KHẨN_CẤP' ? 24 : priority === 'CAO' ? 16 : 8;
     
-    pushToQueue(names[Math.floor(Math.random() * names.length)], { vram, priority });
+    await pushToQueue(names[Math.floor(Math.random() * names.length)], { vram, priority });
     vibrate(HAPTIC.NEURAL);
   };
 
-  const executeJob = (id: string, executor: Job['executor'], nodeId: string) => {
+  const executeJob = async (id: string, executor: Job['executor'], nodeId: string) => {
     addLog(`KHỞI_TẠO: Giai đoạn cô lập đang hoạt động trên ${executor} (${nodeId}).`, 'GỠ_LỖI', executor);
     vibrate(HAPTIC.RUN);
 
-    setTimeout(() => {
-      setQueue(prev => {
-        const currentJob = prev.find(j => j.id === id);
-        if (!currentJob || currentJob.status !== 'ĐANG_CÔ_LẬP') return prev;
-
+    setTimeout(async () => {
+      try {
+        await updateDoc(doc(db, 'tasks', id), { status: 'ĐANG_CHẠY' });
         addLog(`ĐANG_CHẠY: Thực thi tự hành đang hoạt động trên ${nodeId}`, 'THÔNG_TIN', executor);
         
-        const streamInterval = setInterval(() => {
-          setQueue(q => {
-            const sj = q.find(job => job.id === id);
-            if (!sj || sj.status !== 'ĐANG_CHẠY') {
-              clearInterval(streamInterval);
-              return q;
-            }
-            const duration = (Date.now() - sj.metrics!.startTime) / 1000;
-            const computeTime = Math.max(0.01, duration - (networkOverhead / 1000));
-            const baseTps = executor === 'REMOTE' ? 130 : 60;
-            const loadFactor = 1 - (session.cpuLoad / 400); 
-            const currentTps = Math.floor(baseTps * loadFactor * (0.9 + Math.random() * 0.2));
-            const throughput = `${currentTps} tok/s`;
-            
-            return q.map(j => j.id === id ? { ...j, metrics: { 
-              ...j.metrics!, 
-              throughput, 
-              tokens: Math.floor(currentTps * computeTime) 
-            } } : j);
+        const streamInterval = setInterval(async () => {
+          const sj = queue.find(job => job.id === id);
+          if (!sj || sj.status !== 'ĐANG_CHẠY') {
+            clearInterval(streamInterval);
+            return;
+          }
+          
+          const duration = (sj.metrics?.startTime ? (Date.now() - sj.metrics.startTime) / 1000 : 0);
+          const computeTime = Math.max(0.01, duration - (networkOverhead / 1000));
+          const baseTps = executor === 'REMOTE' ? 130 : 60;
+          const loadFactor = 1 - (session.cpuLoad / 400); 
+          const currentTps = Math.floor(baseTps * loadFactor * (0.9 + Math.random() * 0.2));
+          const throughput = `${currentTps} tok/s`;
+          
+          await updateDoc(doc(db, 'tasks', id), {
+            "metrics.throughput": throughput,
+            "metrics.tokens": Math.floor(currentTps * computeTime)
           });
         }, 5000);
 
-        setTimeout(() => {
-          setQueue(finalQueue => {
-            const finalJob = finalQueue.find(j => j.id === id);
-            if (!finalJob || finalJob.status !== 'ĐANG_CHẠY') return finalQueue;
+        setTimeout(async () => {
+          const finalJob = queue.find(j => j.id === id);
+          if (!finalJob || finalJob.status !== 'ĐANG_CHẠY') return;
 
-            clearInterval(streamInterval);
-            addLog(`THÀNH_CÔNG: ${id} hoàn tất. Tối ưu hóa toàn bộ các nút.`, 'THÀNH_CÔNG', executor);
-            triggerNotification(`Tác vụ ${id} hoàn tất.`, 'SUCCESS');
-            vibrate(HAPTIC.SUCCESS);
-            setSession(s => ({ ...s, learningProgress: Math.min(100, s.learningProgress + 2) }));
-            return finalQueue.map(j => j.id === id ? { ...j, status: 'THÀNH_CÔNG' } : j);
-          });
+          clearInterval(streamInterval);
+          addLog(`THÀNH_CÔNG: ${id} hoàn tất. Tối ưu hóa toàn bộ các nút.`, 'THÀNH_CÔNG', executor);
+          triggerNotification(`Tác vụ ${id} hoàn tất.`, 'SUCCESS');
+          vibrate(HAPTIC.SUCCESS);
+          setSession(s => ({ ...s, learningProgress: Math.min(100, s.learningProgress + 2) }));
+          
+          await updateDoc(doc(db, 'tasks', id), { status: 'THÀNH_CÔNG' });
         }, 15000);
-
-        return prev.map(j => j.id === id ? { ...j, status: 'ĐANG_CHẠY' } : j);
-      });
+      } catch (error) {
+        console.error("Execution state sync failed:", error);
+      }
     }, 1500);
   };
 
-  const createJob = (name: string, vram = 8, priority: JobRequirements['priority'] = 'THẤP') => {
+  const createJob = async (name: string, vram = 8, priority: JobRequirements['priority'] = 'THẤP') => {
+    if (!currentUser) return;
     const id = `J-${Math.floor(Math.random() * 900) + 100}`;
     const priorityBase = SCHEDULER_CONFIG.PRIORITY_WEIGHTS[priority];
     const cost = (vram * 1.5) + (priorityBase * 0.2) + 5;
     
-    const newJob: Job = {
+    const newJob: any = {
       id,
       name,
       requirements: { vram, priority, latency: vram > 16 ? 'LÔ' : 'THỜI_GIAN_THỰC' },
@@ -722,18 +852,29 @@ export default function App() {
       estCost: `${(cost / 50).toFixed(2)}$`,
       retries: 0,
       cost,
-      waitTicks: 0
+      waitTicks: 0,
+      ownerId: currentUser.uid,
+      createdAt: serverTimestamp()
     };
-    setQueue(prev => [newJob, ...prev]);
-    addLog(`HỆ_THỐNG: Nút thủ công đã đăng ký: ${id}. Tải: ${cost.toFixed(0)} RU.`, 'THÔNG_TIN');
-    triggerNotification(`Đã tạo Tác vụ Mới: ${id}`, 'SUCCESS');
-    vibrate(HAPTIC.SUCCESS);
+    
+    try {
+      await setDoc(doc(db, 'tasks', id), newJob);
+      addLog(`HỆ_THỐNG: Nút thủ công đã đăng ký: ${id}. Tải: ${cost.toFixed(0)} RU.`, 'THÔNG_TIN');
+      triggerNotification(`Đã tạo Tác vụ Mới: ${id}`, 'SUCCESS');
+      vibrate(HAPTIC.SUCCESS);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, `tasks/${id}`);
+    }
   };
 
-  const cancelJob = (id: string) => {
-    setQueue(prev => prev.map(j => j.id === id ? { ...j, status: 'LỖI' } : j));
-    addLog(`HỆ_THỐNG: Đã xác nhận chấm dứt thủ công tác vụ ${id}.`, 'CẢNH_BÁO', 'NGƯỜI_DÙNG');
-    vibrate(HAPTIC.ERROR);
+  const cancelJob = async (id: string) => {
+    try {
+      await updateDoc(doc(db, 'tasks', id), { status: 'LỖI' });
+      addLog(`HỆ_THỐNG: Đã xác nhận chấm dứt thủ công tác vụ ${id}.`, 'CẢNH_BÁO', 'NGƯỜI_DÙNG');
+      vibrate(HAPTIC.ERROR);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, `tasks/${id}`);
+    }
   };
 
   const compilePipeline = async () => {
@@ -788,6 +929,25 @@ export default function App() {
       const realThroughput = Math.floor((complexity / (computeLatency / 1000)));
       
       setAiResult(code);
+      
+      if (currentUser) {
+        try {
+          const snippetId = `LIB-${Math.random().toString(36).substr(2, 6).toUpperCase()}`;
+          await setDoc(doc(db, 'library', snippetId), {
+            id: snippetId,
+            title: prompt.length > 30 ? prompt.substring(0, 30) + '...' : prompt,
+            description: `Generated from prompt: ${prompt}`,
+            code: code,
+            type: 'AI_GENERATED',
+            ownerId: currentUser.uid,
+            createdAt: serverTimestamp()
+          });
+          addLog(`THƯ_VIỆN: Phân đoạn AI mới [${snippetId}] đã được lưu trữ liên bang.`, 'THÀNH_CÔNG');
+        } catch (error) {
+          console.error("Library save failed:", error);
+        }
+      }
+
       setNeuralCache(prev => {
         const next = { 
           ...prev, 
@@ -880,12 +1040,40 @@ export default function App() {
           </div>
         </div>
 
-        <div className="hidden xl:flex gap-12 items-center">
-           <MetricPill label="Hội tụ Logic" val={`${session.learningProgress}%`} sub="Độ chín bộ não" />
-           <div className="w-[1px] h-10 bg-white/5" />
-           <MetricPill label="Lưới nút" val={queue.filter(j => j.status === 'ĐANG_CHẠY').length.toString()} sub="Luồng hoạt động" />
-           <div className="w-[1px] h-10 bg-white/5" />
-           <MetricPill label="Quyết định tiếp" val="T-GIÂY" sub="Ngữ cảnh thần kinh" />
+        <div className="flex items-center gap-4 md:gap-8">
+          <div className="hidden xl:flex gap-12 items-center">
+             <MetricPill label="Hội tụ Logic" val={`${session.learningProgress}%`} sub="Độ chín bộ não" />
+             <div className="w-[1px] h-10 bg-white/5" />
+             <MetricPill label="Lưới nút" val={queue.filter(j => j.status === 'ĐANG_CHẠY').length.toString()} sub="Luồng hoạt động" />
+             <div className="w-[1px] h-10 bg-white/5" />
+             <MetricPill label="Quyết định tiếp" val="T-GIÂY" sub="Ngữ cảnh thần kinh" />
+          </div>
+
+          <div className="flex items-center gap-4">
+            {currentUser ? (
+              <div className="flex items-center gap-3">
+                <div className="hidden md:block text-right">
+                  <p className="text-[10px] font-black text-white uppercase tracking-wider">{currentUser.displayName || 'Operator'}</p>
+                  <p className="text-[8px] text-slate-500 font-mono truncate max-w-[100px]">{currentUser.email}</p>
+                </div>
+                <button 
+                  onClick={handleLogout}
+                  className="w-10 h-10 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-slate-400 hover:text-red-500 hover:bg-red-500/10 transition-all group"
+                  title="Đăng xuất"
+                >
+                  <LogOut className="w-5 h-5 group-hover:scale-90 transition-transform" />
+                </button>
+              </div>
+            ) : (
+              <button 
+                onClick={handleLogin}
+                className="flex items-center gap-3 px-5 py-2.5 rounded-xl bg-brand-primary text-black font-black uppercase text-[10px] tracking-widest hover:brightness-110 active:scale-95 transition-all"
+              >
+                <LogIn className="w-4 h-4" />
+                <span>ĐĂNG_NHẬP</span>
+              </button>
+            )}
+          </div>
         </div>
       </header>
 
@@ -1104,22 +1292,22 @@ export default function App() {
                         </button>
                      </div>
 
-                     {aiResult && (
-                       <motion.div initial={{ opacity: 0, y: 50 }} animate={{ opacity: 1, y: 0 }} className="mt-12 md:mt-20 text-left">
-                          <div className="flex flex-col md:flex-row md:items-center justify-between mb-6 md:mb-8 px-4 md:px-12 gap-4">
-                             <span className="text-[10px] md:text-[12px] font-black uppercase text-brand-primary tracking-[0.4em] md:tracking-[0.6em]">Hardened Output // Node-6</span>
-                             <button onClick={() => handleCopy('pipeline-v5', aiResult)} className="text-[10px] md:text-[12px] font-black uppercase text-slate-500 hover:text-white flex items-center gap-3 transition-all">
-                                <Copy className="w-5 h-5 md:w-6 md:h-6" /> Export Sequence
-                             </button>
-                          </div>
-                          <div className="bg-black border border-white/5 p-8 md:p-16 rounded-[2.5rem] md:rounded-[4rem] font-mono text-[11px] md:text-[13px] text-brand-primary/70 overflow-x-auto shadow-4xl max-h-[400px] md:max-h-[600px] ring-1 ring-white/5 leading-relaxed">
-                             {aiResult}
-                          </div>
-                       </motion.div>
-                     )}
-                  </div>
-               </div>
-            </motion.div>
+                      {aiResult && (
+                        <motion.div initial={{ opacity: 0, y: 50 }} animate={{ opacity: 1, y: 0 }} className="mt-12 md:mt-20 text-left">
+                           <div className="flex flex-col md:flex-row md:items-center justify-between mb-6 md:mb-8 px-4 md:px-12 gap-4">
+                              <span className="text-[10px] md:text-[12px] font-black uppercase text-brand-primary tracking-[0.4em] md:tracking-[0.6em]">Hardened Output // Node-6</span>
+                              <button onClick={() => handleCopy('pipeline-v5', aiResult)} className="text-[10px] md:text-[12px] font-black uppercase text-slate-500 hover:text-white flex items-center gap-3 transition-all">
+                                 <Copy className="w-5 h-5 md:w-6 md:h-6" /> Export Sequence
+                              </button>
+                           </div>
+                           <div className="bg-black border border-white/5 p-8 md:p-16 rounded-[2.5rem] md:rounded-[4rem] font-mono text-[11px] md:text-[13px] text-brand-primary/70 overflow-x-auto shadow-4xl max-h-[400px] md:max-h-[600px] ring-1 ring-white/5 leading-relaxed">
+                              {aiResult}
+                           </div>
+                        </motion.div>
+                      )}
+                   </div>
+                </div>
+             </motion.div>
           )}
 
           {activeTab === 'library' && (
@@ -1130,7 +1318,7 @@ export default function App() {
                </div>
 
                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 md:gap-10">
-                  {ELITE_SNIPPETS.map((snippet) => (
+                  {library.map((snippet) => (
                     <div key={snippet.id} className="glass-panel p-8 md:p-12 rounded-[3.5rem] md:rounded-[4.5rem] border-white/5 hover:border-brand-primary/30 transition-all group relative overflow-hidden bg-white/[0.01]">
                        <div className="absolute top-0 right-0 p-10 opacity-5 group-hover:opacity-20 transition-opacity">
                          <Layers className="w-24 md:w-40 h-24 md:h-40" />
