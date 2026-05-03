@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState, useEffect, ReactNode } from 'react';
+import { useState, useEffect, ReactNode, useMemo } from 'react';
 import { 
   Play, 
   RotateCw, 
@@ -35,6 +35,9 @@ import { motion, AnimatePresence } from 'motion/react';
 import { GoogleGenAI } from "@google/genai";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
+if (!process.env.GEMINI_API_KEY) {
+  console.warn("CẢNH BÁO: Thiếu GEMINI_API_KEY. Vui lòng thiết lập biến môi trường này.");
+}
 
 const ELITE_SNIPPETS = [
   {
@@ -84,25 +87,42 @@ def isolate_execution():
 
 interface LogEntry {
   timestamp: string;
-  level: 'INFO' | 'WARN' | 'ERROR' | 'CRITICAL' | 'DEBUG' | 'BRAIN';
+  level: 'THÔNG_TIN' | 'THÀNH_CÔNG' | 'CẢNH_BÁO' | 'LỖI' | 'NGHIÊM_TRỌNG' | 'GỠ_LỖI' | 'BỘ_NÃO' | 'NHÂN';
   msg: string;
   executor?: string;
 }
 
 interface JobRequirements {
   vram: number;
-  priority: 'CRITICAL' | 'HIGH' | 'LOW';
-  latency: 'REALTIME' | 'BATCH';
+  priority: 'KHẨN_CẤP' | 'CAO' | 'TRUNG_BÌNH' | 'THẤP';
+  latency: 'THỜI_GIAN_THỰC' | 'LÔ';
 }
 
 interface Job {
   id: string;
   name: string;
   requirements: JobRequirements;
-  status: 'QUEUED' | 'ROUTING' | 'ISOLATING' | 'RUNNING' | 'SUCCESS' | 'FAILURE';
-  executor: 'PENDING' | 'COLAB' | 'REMOTE' | 'EDGE';
+  status: 'CHỜ_DUYỆT' | 'XẾP_HÀNG' | 'ĐANG_ĐIỀU_PHỐI' | 'ĐANG_CÔ_LẬP' | 'ĐANG_CHẠY' | 'THÀNH_CÔNG' | 'LỖI';
+  executor: 'ĐANG_CHỜ' | 'COLAB' | 'REMOTE' | 'EDGE';
   estCost: string;
   retries: number;
+  waitTicks?: number;
+  reservedAt?: number;
+  cost?: number;
+  metrics?: {
+    throughput: string;
+    nodeId: string;
+    startTime: number;
+    tokens?: number;
+  };
+}
+
+interface CacheEntry {
+  data: string;
+  timestamp: number;
+  latency: number;
+  lastAccessed: number;
+  tokens: number;
 }
 
 interface OSCheckpoint {
@@ -128,6 +148,9 @@ interface SessionState {
   activeExecutor: 'COLAB' | 'REMOTE' | 'AUTONOMOUS';
   predictiveAlert: boolean;
   learningProgress: number;
+  cpuLoad: number;
+  temp: number;
+  latency: number;
 }
 
 const HAPTIC = {
@@ -139,33 +162,103 @@ const HAPTIC = {
   CRITICAL: [200, 50, 200]
 };
 
+const SCHEDULER_CONFIG = {
+  TOTAL_CAPACITY: 100,
+  PRIORITY_WEIGHTS: {
+    KHẨN_CẤP: 250, 
+    CAO: 100,
+    TRUNG_BÌNH: 40,
+    THẤP: 15
+  },
+  QUOTAS: {
+    MAX_CRITICAL: 0.85,
+    RESERVED_LOW: 10,
+    BACKPRESSURE_THRESHOLD: 18 // Giới hạn mềm cho hàng đợi
+  },
+  HYSTERESIS: {
+    HOT: 88,
+    WARM: 68,
+    FACTOR: 0.4,
+    RAMP_RATE: 0.1 // Tốc độ hồi phục mỗi chu kỳ
+  },
+  RESERVATION: {
+    WINDOW_RU: 55,
+    TIMEOUT_TICKS: 15
+  },
+  AGING: {
+    FACTOR: 10,
+    CAP: 140
+  },
+  NETWORK: {
+    WINDOW_SIZE: 20,
+    DEFAULT_OVERHEAD: 180,
+    MAD_THRESHOLD: 2.5 // Loại bỏ nhiễu > 2.5 * MAD
+  }
+};
+
+// EMA Alpha for smoothing metrics
+const SMOOTHING_ALPHA = 0.3;
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<'hub' | 'forge' | 'library' | 'system'>('hub');
   const [showOrbital, setShowOrbital] = useState(false);
   const [notifications, setNotifications] = useState<OSNotification[]>([]);
   const [pendingActions, setPendingActions] = useState<Record<string, any>>({});
   
-  const [session, setSession] = useState<SessionState>(() => {
+  const [neuralCache, setNeuralCache] = useState<Record<string, CacheEntry>>(() => {
     try {
-      const saved = localStorage.getItem('elite_session');
-      return saved ? JSON.parse(saved) : {
-        status: 'connected',
-        vramLoad: 12,
-        activeExecutor: 'AUTONOMOUS',
-        predictiveAlert: false,
-        learningProgress: 76
-      };
+      const saved = localStorage.getItem('elite_neural_cache');
+      if (!saved) return {};
+      const parsed = JSON.parse(saved);
+      
+      const now = Date.now();
+      const filtered: Record<string, CacheEntry> = {};
+      
+      // Sort by lastAccessed for LRU logic on boot if we exceed capacity
+      const entries = Object.entries(parsed).sort((a: any, b: any) => b[1].lastAccessed - a[1].lastAccessed);
+      const MAX_ENTRIES = 50;
+
+      entries.forEach(([key, val], idx) => {
+        const entry = val as CacheEntry;
+        if (now - entry.timestamp < 86400000 && idx < MAX_ENTRIES) {
+          filtered[key] = entry;
+        }
+      });
+      return filtered;
     } catch {
-      return { status: 'connected', vramLoad: 12, activeExecutor: 'AUTONOMOUS', predictiveAlert: false, learningProgress: 76 };
+      return {};
     }
   });
+
+  const [session, setSession] = useState<SessionState>(() => {
+    const defaults = {
+      status: 'đã kết nối',
+      vramLoad: 12,
+      activeExecutor: 'TỰ_HÀNH',
+      predictiveAlert: false,
+      learningProgress: 76,
+      cpuLoad: 24,
+      temp: 42,
+      latency: 18
+    };
+    try {
+      const saved = localStorage.getItem('elite_session');
+      return saved ? { ...defaults, ...JSON.parse(saved) } : defaults;
+    } catch {
+      return defaults;
+    }
+  });
+
+  useEffect(() => {
+    localStorage.setItem('elite_neural_cache', JSON.stringify(neuralCache));
+  }, [neuralCache]);
   
   const [logs, setLogs] = useState<LogEntry[]>(() => {
     try {
       const saved = localStorage.getItem('elite_logs');
       return saved ? JSON.parse(saved) : [
-        { timestamp: new Date().toLocaleTimeString(), level: 'BRAIN', msg: 'Neural Router analyzing network latency...' },
-        { timestamp: new Date().toLocaleTimeString(), level: 'INFO', msg: 'Elite OS v6.0 Autonomous Brain initialized.' }
+        { timestamp: new Date().toLocaleTimeString(), level: 'NHÂN', msg: 'Nhân hệ thống v6.8.2 đã kích hoạt. Bảo vệ bộ nhớ đang hoạt động.' },
+        { timestamp: new Date().toLocaleTimeString(), level: 'BỘ_NÃO', msg: 'Elite OS v6.0 Bộ não Tự hành đã khởi tạo.' }
       ];
     } catch {
       return [];
@@ -176,14 +269,129 @@ export default function App() {
     try {
       const saved = localStorage.getItem('elite_queue');
       return saved ? JSON.parse(saved) : [
-        { id: 'J-601', name: 'Global Model Distill', requirements: { vram: 40, priority: 'CRITICAL', latency: 'BATCH' }, status: 'QUEUED', executor: 'PENDING', estCost: '0.00$', retries: 0 },
-        { id: 'J-602', name: 'Real-time Inference', requirements: { vram: 4, priority: 'HIGH', latency: 'REALTIME' }, status: 'QUEUED', executor: 'PENDING', estCost: '0.00$', retries: 0 },
-        { id: 'J-603', name: 'Dataset Sharding', requirements: { vram: 8, priority: 'LOW', latency: 'BATCH' }, status: 'SUCCESS', executor: 'COLAB', estCost: '0.01$', retries: 0 }
+        { id: 'J-601', name: 'Chưng cất Mô hình Toàn cầu', requirements: { vram: 40, priority: 'KHẨN_CẤP', latency: 'LÔ' }, status: 'XẾP_HÀNG', executor: 'ĐANG_CHỜ', estCost: '0.00$', retries: 0 },
+        { id: 'J-602', name: 'Suy luận Thời gian thực', requirements: { vram: 4, priority: 'CAO', latency: 'THỜI_GIAN_THỰC' }, status: 'XẾP_HÀNG', executor: 'ĐANG_CHỜ', estCost: '0.00$', retries: 0 },
+        { id: 'J-603', name: 'Phân mảnh Dữ liệu', requirements: { vram: 8, priority: 'THẤP', latency: 'LÔ' }, status: 'THÀNH_CÔNG', executor: 'COLAB', estCost: '0.01$', retries: 0 }
       ];
     } catch {
       return [];
     }
   });
+
+  const [latencyHistory, setLatencyHistory] = useState<number[]>([]);
+  const [isThrottled, setIsThrottled] = useState(false);
+  const [recoveryRamp, setRecoveryRamp] = useState(1.0);
+
+  useEffect(() => {
+    if (isThrottled) {
+      setRecoveryRamp(SCHEDULER_CONFIG.HYSTERESIS.FACTOR);
+    } else if (recoveryRamp < 1.0) {
+      // Gradual recovery to prevent oscillation
+      const timer = setTimeout(() => {
+        setRecoveryRamp(prev => Math.min(1.0, prev + SCHEDULER_CONFIG.HYSTERESIS.RAMP_RATE));
+      }, 1000);
+      return () => clearTimeout(timer);
+    }
+  }, [isThrottled, recoveryRamp]);
+
+  // v6.0 Robust Network Telemetry using MAD (Median Absolute Deviation)
+  const networkOverhead = useMemo(() => {
+    if (latencyHistory.length < 3) return SCHEDULER_CONFIG.NETWORK.DEFAULT_OVERHEAD;
+    
+    const sorted = [...latencyHistory].sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)];
+    
+    // Calculate MAD
+    const deviations = sorted.map(v => Math.abs(v - median)).sort((a, b) => a - b);
+    const mad = deviations[Math.floor(deviations.length / 2)];
+    const threshold = Math.max(50, mad * SCHEDULER_CONFIG.NETWORK.MAD_THRESHOLD);
+    
+    // Filter outliers and return mean of valid points
+    const validPoints = sorted.filter(v => Math.abs(v - median) <= threshold);
+    return validPoints.length > 0 
+      ? validPoints.reduce((a, b) => a + b, 0) / validPoints.length 
+      : median;
+  }, [latencyHistory]);
+
+  useEffect(() => {
+    if (session.temp > SCHEDULER_CONFIG.HYSTERESIS.HOT) setIsThrottled(true);
+    if (session.temp < SCHEDULER_CONFIG.HYSTERESIS.WARM) setIsThrottled(false);
+  }, [session.temp]);
+
+  useEffect(() => {
+    const activeJobs = queue.filter(j => j.status === 'ĐANG_CHẠY' || j.status === 'ĐANG_ĐIỀU_PHỐI' || j.status === 'ĐANG_CÔ_LẬP');
+    const queuedJobs = queue.filter(j => j.status === 'XẾP_HÀNG');
+    
+    // v6.5 Bộ điều tốc công suất nâng cao
+    const currentCapacity = SCHEDULER_CONFIG.TOTAL_CAPACITY * recoveryRamp;
+    
+    const currentLoad = activeJobs.reduce((acc, curr) => acc + (curr.cost || 20), 0);
+    const criticalLoad = activeJobs.filter(j => j.requirements.priority === 'CRITICAL')
+                                  .reduce((acc, curr) => acc + (curr.cost || 20), 0);
+
+    if (queuedJobs.length > 0) {
+      // v6.5 Điểm số lũy tiến (Age-Cap Aware)
+      const scoredQueue = queuedJobs.map(j => {
+        const bonus = Math.min(SCHEDULER_CONFIG.AGING.CAP, Math.log2(1 + (j.waitTicks || 0)) * SCHEDULER_CONFIG.AGING.FACTOR);
+        const score = SCHEDULER_CONFIG.PRIORITY_WEIGHTS[j.requirements.priority] + bonus;
+        return { ...j, score };
+      }).sort((a, b) => b.score - a.score);
+
+      const nextJob = scoredQueue[0];
+      const nextJobCost = nextJob.cost || 20;
+
+      // Admission 6.5: Quota Dự báo + Reservation Sâu
+      const availableRU = currentCapacity - currentLoad;
+      const isCriticalCapped = nextJob.requirements.priority === 'KHẨN_CẤP' && 
+                               (criticalLoad + nextJobCost) > (currentCapacity * SCHEDULER_CONFIG.QUOTAS.MAX_CRITICAL);
+
+      // Cửa sổ giữ chỗ sâu: Tìm các tác vụ quan trọng lớn trong hàng đợi
+      const lookaheadDepth = Math.min(10, 5 + Math.floor(queuedJobs.length / 4));
+      const pendingLargeCritical = scoredQueue.slice(0, lookaheadDepth).some(j => (j.cost || 0) > 40 && j.requirements.priority === 'KHẨN_CẤP');
+      const isReserved = pendingLargeCritical && nextJob.requirements.priority !== 'KHẨN_CẤP' && availableRU < SCHEDULER_CONFIG.RESERVATION.WINDOW_RU;
+
+      if (availableRU >= nextJobCost && !isCriticalCapped && !isReserved) {
+        handlePipeline(nextJob.id); 
+      } else {
+        // Lấp đầy (Backfilling): Chỉ chạy nếu tải thấp hoặc job cực nhẹ
+        const backfillJob = scoredQueue.find(j => 
+          (j.cost || 0) <= Math.min(12, availableRU * 0.5) && 
+          j.requirements.priority !== 'KHẨN_CẤP'
+        );
+
+        if (backfillJob && !isReserved) {
+          handlePipeline(backfillJob.id);
+        } else {
+          // Tăng chu kỳ chờ cho các job đang xếp hàng
+          setQueue(prev => prev.map(j => (j.status === 'XẾP_HÀNG' ? { ...j, waitTicks: (j.waitTicks || 0) + 1 } : j)));
+        }
+      }
+    }
+
+    const activeVram = activeJobs.reduce((acc, curr) => acc + curr.requirements.vram, 0);
+    
+    setSession(prev => {
+      const baseCpu = 2 + (Math.random() * 2);
+      const workloadCpu = activeJobs.reduce((acc, curr) => {
+        const priorityWeight = curr.requirements.priority === 'CRITICAL' ? 1.6 : 1.0;
+        const currentTokens = curr.metrics?.tokens || 500;
+        return acc + (currentTokens / 150) + (curr.requirements.vram * 0.2 * priorityWeight);
+      }, 0);
+      
+      const newCpu = Math.min(100, baseCpu + workloadCpu);
+      const targetTemp = 32 + (newCpu * 0.4) + (activeVram * 0.04);
+      const newTemp = prev.temp * (1 - SMOOTHING_ALPHA) + targetTemp * SMOOTHING_ALPHA;
+      const newVram = Math.min(100, 5 + (activeVram * 1.25) + (activeJobs.length * 1.5)); 
+      
+      return { 
+        ...prev, 
+        vramLoad: newVram, 
+        cpuLoad: newCpu,
+        temp: newTemp,
+        predictiveAlert: newCpu > 85 || newTemp > 80 
+      };
+    });
+  }, [queue, isThrottled]);
 
   useEffect(() => {
     localStorage.setItem('elite_session', JSON.stringify(session));
@@ -202,26 +410,21 @@ export default function App() {
 
   useEffect(() => {
     const timer = setTimeout(() => {
-      setSession(prev => ({ ...prev, status: 'connected' }));
-      addLog('Uplink synchronized with Federated Runtime Cluster.', 'INFO', 'CORE-FED');
+      setSession(prev => ({ ...prev, status: 'đã kết nối' }));
+      addLog('Đường truyền đã đồng bộ với Cụm thời gian chạy Liên bang.', 'THÔNG_TIN', 'NHÂN-LBB');
     }, 1200);
     return () => clearTimeout(timer);
   }, []);
 
-  const addLog = (msg: string, level: LogEntry['level'] = 'INFO', executor: string = 'BRAIN') => {
+  const addLog = (msg: string, level: LogEntry['level'] = 'THÔNG_TIN', executor: string = 'BỘ_NÃO') => {
     const entry: LogEntry = { timestamp: new Date().toLocaleTimeString(), level, msg, executor };
-    setLogs(prev => [entry, ...prev].slice(0, 25));
+    setLogs(prev => [entry, ...prev].slice(0, 50));
     
-    if (level === 'ERROR' || level === 'CRITICAL') {
+    if (level === 'LỖI' || level === 'NGHIÊM_TRỌNG') {
       triggerNotification(msg, 'ERROR');
       vibrate(HAPTIC.ERROR);
-    } else if (level === 'BRAIN') {
+    } else if (level === 'BỘ_NÃO') {
       vibrate(HAPTIC.NEURAL);
-    }
-    
-    if (session.vramLoad > 80) {
-      setSession(prev => ({ ...prev, predictiveAlert: true }));
-      addLog('BRAIN: Predictive OOM detected in sequence. Adjusting strategy.', 'WARN', 'BRAIN');
     }
   };
 
@@ -239,20 +442,95 @@ export default function App() {
     }
   };
 
+  const nukeSession = () => {
+    vibrate(HAPTIC.CRITICAL);
+    localStorage.clear();
+    setSession({ 
+      status: 'đã kết nối', 
+      vramLoad: 12, 
+      activeExecutor: 'TỰ_HÀNH', 
+      predictiveAlert: false, 
+      learningProgress: 76,
+      cpuLoad: 24,
+      temp: 42,
+      latency: 18
+    });
+    setQueue([]);
+    setLogs([{ timestamp: new Date().toLocaleTimeString(), level: 'NGHIÊM_TRỌNG', msg: 'KHẨN CẤP HỆ THỐNG: Giao thức Hủy diệt đã thực thi. Tất cả các nút đã được dọn sạch.' }]);
+    triggerNotification('HỆ THỐNG ĐÃ ĐƯỢC DỌN SẠCH', 'ERROR');
+  };
+
+  const optimizeKernel = () => {
+    vibrate(HAPTIC.NEURAL);
+    addLog('NHÂN: Đang khởi tạo hồi phục tài nguyên dự báo...', 'NHÂN');
+    
+    setTimeout(() => {
+      setQueue(prev => {
+        const kept = prev.filter(j => j.status !== 'THÀNH_CÔNG' && j.status !== 'LỖI');
+        
+        // Tiered Resource Protection Logic
+        if (session.cpuLoad > 80) {
+          addLog('NHÂN: Tải > 80%. Đang loại bỏ các nút ưu tiên THẤP.', 'CẢNH_BÁO');
+          return kept.filter(j => j.requirements.priority !== 'THẤP' || j.status !== 'ĐANG_CHẠY');
+        }
+        if (session.cpuLoad > 90) {
+          addLog('NHÂN: Tải > 90%. Dọn dẹp khẩn cấp các nút ưu tiên TRUNG_BÌNH.', 'NGHIÊM_TRỌNG');
+          return kept.filter(j => j.requirements.priority === 'KHẨN_CẤP' || j.status !== 'ĐANG_CHẠY');
+        }
+        
+        return kept;
+      });
+
+      setSession(prev => ({ 
+        ...prev, 
+        learningProgress: Math.min(100, prev.learningProgress + 3),
+        cpuLoad: Math.max(5, prev.cpuLoad * 0.5) // Instant relief
+      }));
+      addLog('NHÂN: Tập lệnh đã được song song hóa. Các bể tài nguyên đã bình thường hóa.', 'THÀNH_CÔNG');
+      triggerNotification('Nhân v3 đã tối ưu', 'SUCCESS');
+    }, 1200);
+  };
+
+  const flushCache = () => {
+    vibrate(HAPTIC.WARN);
+    addLog('BỘ_NÃO: Đang dọn sạch bộ nhớ đệm thần kinh và ngăn xếp gỡ lỗi...', 'BỘ_NÃO');
+    setTimeout(() => {
+      setNeuralCache({});
+      setLogs(prev => prev.filter(l => l.level !== 'GỠ_LỖI'));
+      addLog('BỘ_NÃO: Bộ nhớ đệm thần kinh đã vô hiệu. Còn lại 0 mục.', 'THÔNG_TIN');
+      triggerNotification('Đã xóa bộ nhớ đệm', 'INFO');
+    }, 1000);
+  };
+
+  const removeJob = (id: string) => {
+    setQueue(prev => prev.filter(j => j.id !== id));
+    addLog(`GIÁM_SÁT_OS: Tác vụ ${id} đã bị dọn sạch khỏi ma trận.`, 'THÔNG_TIN');
+  };
+
   const handleGuardedSwipe = (job: Job, direction: 'LEFT' | 'RIGHT') => {
-    if (job.requirements.priority === 'CRITICAL' && direction === 'LEFT') {
+    if (job.requirements.priority === 'KHẨN_CẤP' && direction === 'LEFT') {
       vibrate(HAPTIC.CRITICAL);
-      triggerNotification(`System Lock: CRITICAL job ${job.id} cannot be manually terminated.`, 'ERROR');
+      triggerNotification(`Khóa hệ thống: Tác vụ KHẨN CẤP ${job.id} không thể chấm dứt thủ công.`, 'ERROR');
       return;
     }
 
     if (direction === 'RIGHT') {
       vibrate(HAPTIC.RUN);
-      routeJob(job.id);
+      if (job.status === 'THÀNH_CÔNG' || job.status === 'LỖI') {
+         // Cycle back to queued
+         setQueue(prev => prev.map(j => j.id === job.id ? { ...j, status: 'XẾP_HÀNG', executor: 'ĐANG_CHỜ' } : j));
+         addLog(`THỬ_LẠI: Đang xếp hàng lại ${job.id} cho vòng đời mới.`, 'THÔNG_TIN');
+      } else {
+         handlePipeline(job.id);
+      }
     } else {
       // Guarded Kill with Undo
       const timeoutId = setTimeout(() => {
-        cancelJob(job.id);
+        if (job.status === 'THÀNH_CÔNG' || job.status === 'LỖI' || job.status === 'XẾP_HÀNG') {
+          removeJob(job.id);
+        } else {
+          cancelJob(job.id);
+        }
         setPendingActions(prev => {
           const next = { ...prev };
           delete next[job.id];
@@ -262,8 +540,9 @@ export default function App() {
 
       setPendingActions(prev => ({ ...prev, [job.id]: timeoutId }));
       vibrate(HAPTIC.WARN);
-      triggerNotification(`Pending Termination: ${job.name}...`, 'WARN', {
-        label: 'UNDO',
+      const actionLabel = (job.status === 'THÀNH_CÔNG' || job.status === 'LỖI' || job.status === 'XẾP_HÀNG') ? 'DỌN SẠCH' : 'CHẤM DỨT';
+      triggerNotification(`Đang chờ ${actionLabel}: ${job.name}...`, 'WARN', {
+        label: 'HOÀN TÁC',
         onUndo: () => {
           clearTimeout(timeoutId);
           setPendingActions(prev => {
@@ -272,86 +551,262 @@ export default function App() {
             return next;
           });
           vibrate(HAPTIC.SUCCESS);
-          addLog(`OS_WATCH: Termination aborted for ${job.id}.`, 'INFO');
+          addLog(`GIÁM_SÁT_OS: ${actionLabel} đã bị hủy bỏ cho ${job.id}.`, 'THÔNG_TIN');
         }
       });
     }
   };
 
-  const routeJob = (id: string) => {
-    const job = queue.find(j => j.id === id);
-    if (!job) return;
+  const pushToQueue = (taskName: string, config: { priority: JobRequirements['priority'], vram: number }) => {
+    // Backpressure v6.5: Cảnh báo theo tầng
+    const queuedCount = queue.filter(j => j.status === 'XẾP_HÀNG').length;
+    const isSaturated = queuedCount >= 18;
+    const isCriticalSaturated = queuedCount >= 25;
+    
+    // Ước lượng ETA v6.5 (Dựa trên RU và throughput trung bình)
+    const totalPendingRU = queue.filter(j => j.status === 'XẾP_HÀNG' || j.status === 'ĐANG_CHẠY')
+                               .reduce((acc, curr) => acc + (curr.cost || 20), 0);
+    const etaSeconds = Math.round(totalPendingRU / 12); 
 
-    setQueue(prev => prev.map(j => j.id === id ? { ...j, status: 'ROUTING' } : j));
-    addLog(`ROUTING: Analyzing optimal node for ${id}...`, 'BRAIN');
+    const id = `TX-${Math.random().toString(36).substr(2, 6).toUpperCase()}`;
+    const contextEst = Math.floor(taskName.length / 4);
+    const priorityBase = SCHEDULER_CONFIG.PRIORITY_WEIGHTS[config.priority];
+    const cost = (config.vram * 1.5) + (priorityBase * 0.2) + contextEst;
 
-    setTimeout(() => {
-      let selectedNode: Job['executor'] = 'COLAB';
-      let cost = '0.02$';
-
-      if (job.requirements.vram > 16 || job.requirements.priority === 'CRITICAL') {
-        selectedNode = 'REMOTE';
-        cost = '1.45$';
-      } else if (job.requirements.latency === 'REALTIME') {
-        selectedNode = 'EDGE';
-        cost = '0.12$';
-      }
-
-      addLog(`DECISION: Routing ${id} to ${selectedNode} node. (Reason: Requirements match)`, 'BRAIN');
-      setQueue(prev => prev.map(j => j.id === id ? { ...j, executor: selectedNode, status: 'ISOLATING', estCost: cost } : j));
-      vibrate(HAPTIC.RUN);
-      executeJob(id, selectedNode);
-    }, 2000);
+    const newJob: Job = {
+      id,
+      name: taskName,
+      status: 'XẾP_HÀNG',
+      requirements: { ...config, latency: config.vram > 16 ? 'LÔ' : 'THỜI_GIAN_THỰC' },
+      executor: 'ĐANG_CHỜ',
+      estCost: `${(cost / 50).toFixed(2)}$`,
+      retries: 0,
+      cost,
+      waitTicks: 0
+    };
+    
+    setQueue(prev => [newJob, ...prev]);
+    
+    if (isCriticalSaturated) {
+      addLog(`QUÁ_TẢI_NGHIÊM_TRỌNG: Hàng chờ vượt ngưỡng an toàn. ETA: ${etaSeconds}s.`, 'NGHIÊM_TRỌNG', 'HỆ_THỐNG');
+      triggerNotification(`Hệ thống bão hòa: ETA ${etaSeconds}s`, 'ERROR');
+    } else if (isSaturated) {
+      addLog(`CẢNH_BÁO_ÁP_LỰC: Tải cao. Hàng chờ: ${queuedCount}. ETA dự kiến: ${etaSeconds}s.`, 'CẢNH_BÁO', 'HỆ_THỐNG');
+      triggerNotification(`Tải hệ thống cao: ETA ${etaSeconds}s`, 'WARN');
+    } else {
+      addLog(`ĐIỀU_PHỐI: Tác vụ ${id} đã đăng ký. Độ phức tạp: ${cost.toFixed(0)} RU.`, 'THÔNG_TIN');
+      triggerNotification(`Đã xếp hàng: ${id}`, 'INFO');
+    }
   };
 
-  const executeJob = (id: string, executor: Job['executor']) => {
-    addLog(`INIT: Isolation stage active on ${executor}. Clearing context...`, 'DEBUG', executor);
+  const handlePipeline = (id: string) => {
+    setQueue(prev => {
+      const job = prev.find(j => j.id === id);
+      if (!job || job.status !== 'XẾP_HÀNG') return prev;
+
+      addLog(`ĐIỀU_PHỐI: Đang phân bổ tài nguyên cho ${id}...`, 'BỘ_NÃO');
+      
+      setTimeout(() => {
+        setQueue(q => {
+          const currentJob = q.find(j => j.id === id);
+          if (!currentJob) return q;
+
+          let selectedNode: Job['executor'] = 'COLAB';
+          let cost = '0.02$';
+          const nodeId = `NODE-${selectedNode}-${Math.floor(Math.random() * 99)}`;
+
+          if (currentJob.requirements.vram > 16 || currentJob.requirements.priority === 'KHẨN_CẤP') {
+            selectedNode = 'REMOTE';
+            cost = '1.25$';
+          }
+
+          addLog(`QUYẾT_ĐỊNH: Điều hướng ${id} tới cụm ${selectedNode}. NodeID: ${nodeId}`, 'BỘ_NÃO');
+          executeJob(id, selectedNode, nodeId);
+          return q.map(j => j.id === id ? { ...j, executor: selectedNode, status: 'ĐANG_CÔ_LẬP', estCost: cost, metrics: { throughput: 'Đang tính...', nodeId, startTime: Date.now(), tokens: 0 } } : j);
+        });
+      }, 1500);
+
+      return prev.map(j => j.id === id ? { ...j, status: 'ĐANG_ĐIỀU_PHỐI' } : j);
+    });
+  };
+
+  const addJob = () => {
+    const names = ['Di cư Thần kinh', 'Định hình lại Trọng số', 'Tiêm Ngữ cảnh', 'Ổn định Lớp', 'Tinh chỉnh Hướng dẫn'];
+    const priorities: JobRequirements['priority'][] = ['THẤP', 'TRUNG_BÌNH', 'CAO', 'KHẨN_CẤP'];
+    
+    const priority = priorities[Math.floor(Math.random() * priorities.length)];
+    const vram = priority === 'KHẨN_CẤP' ? 24 : priority === 'CAO' ? 16 : 8;
+    
+    pushToQueue(names[Math.floor(Math.random() * names.length)], { vram, priority });
+    vibrate(HAPTIC.NEURAL);
+  };
+
+  const executeJob = (id: string, executor: Job['executor'], nodeId: string) => {
+    addLog(`KHỞI_TẠO: Giai đoạn cô lập đang hoạt động trên ${executor} (${nodeId}).`, 'GỠ_LỖI', executor);
     vibrate(HAPTIC.RUN);
 
     setTimeout(() => {
-      setQueue(prev => prev.map(j => j.id === id ? { ...j, status: 'RUNNING' } : j));
-      addLog(`RUNNING: Autonomous execution active. Streaming live state...`, 'INFO', executor);
-      
-      const streamInterval = setInterval(() => {
-        addLog(`STREAM: Weights converged at cycle ${Math.floor(Math.random() * 1000)}.`, 'DEBUG', executor);
-      }, 5000);
+      setQueue(prev => {
+        const currentJob = prev.find(j => j.id === id);
+        if (!currentJob || currentJob.status !== 'ĐANG_CÔ_LẬP') return prev;
 
-      setTimeout(() => {
-        clearInterval(streamInterval);
-        setQueue(prev => prev.map(j => j.id === id ? { ...j, status: 'SUCCESS' } : j));
-        addLog(`SUCCESS: ${id} lifecycle complete. Node de-registration initiated.`, 'INFO', executor);
-        triggerNotification(`Job ${id} completed successfully.`, 'SUCCESS');
-        vibrate(HAPTIC.SUCCESS);
-        setSession(prev => ({ ...prev, learningProgress: Math.min(100, prev.learningProgress + 2) }));
-      }, 8000);
-    }, 2000);
+        addLog(`ĐANG_CHẠY: Thực thi tự hành đang hoạt động trên ${nodeId}`, 'THÔNG_TIN', executor);
+        
+        const streamInterval = setInterval(() => {
+          setQueue(q => {
+            const sj = q.find(job => job.id === id);
+            if (!sj || sj.status !== 'ĐANG_CHẠY') {
+              clearInterval(streamInterval);
+              return q;
+            }
+            const duration = (Date.now() - sj.metrics!.startTime) / 1000;
+            const computeTime = Math.max(0.01, duration - (networkOverhead / 1000));
+            const baseTps = executor === 'REMOTE' ? 130 : 60;
+            const loadFactor = 1 - (session.cpuLoad / 400); 
+            const currentTps = Math.floor(baseTps * loadFactor * (0.9 + Math.random() * 0.2));
+            const throughput = `${currentTps} tok/s`;
+            
+            return q.map(j => j.id === id ? { ...j, metrics: { 
+              ...j.metrics!, 
+              throughput, 
+              tokens: Math.floor(currentTps * computeTime) 
+            } } : j);
+          });
+        }, 5000);
+
+        setTimeout(() => {
+          setQueue(finalQueue => {
+            const finalJob = finalQueue.find(j => j.id === id);
+            if (!finalJob || finalJob.status !== 'ĐANG_CHẠY') return finalQueue;
+
+            clearInterval(streamInterval);
+            addLog(`THÀNH_CÔNG: ${id} hoàn tất. Tối ưu hóa toàn bộ các nút.`, 'THÀNH_CÔNG', executor);
+            triggerNotification(`Tác vụ ${id} hoàn tất.`, 'SUCCESS');
+            vibrate(HAPTIC.SUCCESS);
+            setSession(s => ({ ...s, learningProgress: Math.min(100, s.learningProgress + 2) }));
+            return finalQueue.map(j => j.id === id ? { ...j, status: 'THÀNH_CÔNG' } : j);
+          });
+        }, 15000);
+
+        return prev.map(j => j.id === id ? { ...j, status: 'ĐANG_CHẠY' } : j);
+      });
+    }, 1500);
+  };
+
+  const createJob = (name: string, vram = 8, priority: JobRequirements['priority'] = 'THẤP') => {
+    const id = `J-${Math.floor(Math.random() * 900) + 100}`;
+    const priorityBase = SCHEDULER_CONFIG.PRIORITY_WEIGHTS[priority];
+    const cost = (vram * 1.5) + (priorityBase * 0.2) + 5;
+    
+    const newJob: Job = {
+      id,
+      name,
+      requirements: { vram, priority, latency: vram > 16 ? 'LÔ' : 'THỜI_GIAN_THỰC' },
+      status: 'XẾP_HÀNG',
+      executor: 'ĐANG_CHỜ',
+      estCost: `${(cost / 50).toFixed(2)}$`,
+      retries: 0,
+      cost,
+      waitTicks: 0
+    };
+    setQueue(prev => [newJob, ...prev]);
+    addLog(`HỆ_THỐNG: Nút thủ công đã đăng ký: ${id}. Tải: ${cost.toFixed(0)} RU.`, 'THÔNG_TIN');
+    triggerNotification(`Đã tạo Tác vụ Mới: ${id}`, 'SUCCESS');
+    vibrate(HAPTIC.SUCCESS);
   };
 
   const cancelJob = (id: string) => {
-    setQueue(prev => prev.map(j => j.id === id ? { ...j, status: 'FAILURE' } : j));
-    addLog(`USER_SIGINT: Manual termination of ${id} confirmed.`, 'WARN', 'USER');
+    setQueue(prev => prev.map(j => j.id === id ? { ...j, status: 'LỖI' } : j));
+    addLog(`HỆ_THỐNG: Đã xác nhận chấm dứt thủ công tác vụ ${id}.`, 'CẢNH_BÁO', 'NGƯỜI_DÙNG');
     vibrate(HAPTIC.ERROR);
   };
 
   const compilePipeline = async () => {
     if (!prompt.trim()) return;
+
+      // Kiểm tra bộ nhớ đệm thần kinh (Cân nhắc ngữ cảnh)
+      if (neuralCache[prompt]) {
+        const entry = neuralCache[prompt];
+        const hitLatency = 3 + Math.floor(Math.random() * 5);
+        addLog(`BỘ_NÃO: Bộ nhớ trùng khớp. Đang tái hiện ${entry.tokens} tokens từ trọng số nóng.`, 'THÀNH_CÔNG');
+        vibrate(HAPTIC.SUCCESS);
+        
+        setNeuralCache(prev => ({
+          ...prev,
+          [prompt]: { ...entry, lastAccessed: Date.now() }
+        }));
+
+        setAiResult(entry.data);
+        setSession(prev => ({ ...prev, latency: hitLatency })); 
+        setPrompt('');
+        return;
+      }
+
     setIsGenerating(true);
-    addLog('COMPILER: Weaving adaptive multi-node training modules...', 'BRAIN');
+    const startTime = Date.now();
+    addLog('TRÌNH_BIÊN_DỊCH: Đang dệt các hướng dẫn thần kinh thích ứng...', 'BỘ_NÃO');
+    
     try {
       const result = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: `Architect an Autonomous & Federated AI Python script for: ${prompt}.
-        AUTONOMOUS OS REQUIREMENTS:
-        1. FEDERATED: Auto-detect executor environment (Colab/VPS/Edge).
-        2. ADAPTIVE: Auto-adjust batch_size based on real-time pynvml telemetry.
-        3. STREAMING: Real-time JSON weight/gradient streaming (KERNEL_STREAM).
-        4. RESILIENCE: Checkpoint restoration with exponential backoff on retry.
-        OUTPUT RAW CODE ONLY.`,
+        model: "gemini-1.5-flash",
+        contents: [{ role: 'user', parts: [{ text: `Thiết kế một script Python AI Tự hành & Liên bang cho: ${prompt}. CHỈ XUẤT MÃ NGUỒN THUẦN.` }] }],
       });
-      setAiResult(result.text?.replace(/```[a-z]*\n|```/g, '') || "");
-      addLog('COMPILER: Autonomous architecture successfully compiled.', 'INFO', 'AI-FORGE');
+      
+      const latency = Date.now() - startTime;
+      const code = result.text?.replace(/```[a-z]*\n|```/g, '') || "";
+      
+      setLatencyHistory(prev => {
+        const next = [latency, ...prev].slice(0, SCHEDULER_CONFIG.NETWORK.WINDOW_SIZE);
+        return next;
+      });
+
+      const complexity = Math.floor(code.length / 4);
+      const computeLatency = Math.max(50, latency - networkOverhead);
+      const realThroughput = Math.floor((complexity / (computeLatency / 1000)));
+      
+      setAiResult(code);
+      setNeuralCache(prev => {
+        const next = { 
+          ...prev, 
+          [prompt]: { 
+            data: code, 
+            timestamp: Date.now(), 
+            lastAccessed: Date.now(), 
+            latency: computeLatency,
+            tokens: complexity
+          } 
+        };
+        
+        // v6.5 Hybrid LRU-Frequency Eviction (TinyLFU-lite)
+        const keys = Object.keys(next);
+        if (keys.length > 55) {
+           const oldestKey = keys.sort((a, b) => {
+             const recency = next[a].lastAccessed;
+             const frequencyBonus = (next[a].tokens > 0 ? 50000 : 0); 
+             const sizePenalty = next[a].tokens * 8;
+             const scoreA = recency + frequencyBonus - sizePenalty;
+             
+             const recencyB = next[b].lastAccessed;
+             const frequencyBonusB = (next[b].tokens > 0 ? 50000 : 0);
+             const sizePenaltyB = next[b].tokens * 8;
+             const scoreB = recencyB + frequencyBonusB - sizePenaltyB;
+             
+             return scoreA - scoreB;
+           })[0];
+           delete next[oldestKey];
+           addLog('BỘ_NÃO: Cân bằng lại bể nhớ đệm. Đã loại bỏ các trọng số giá trị thấp.', 'CẢNH_BÁO');
+        }
+        return next;
+      });
+      
+      setSession(prev => ({ 
+        ...prev, 
+        latency: computeLatency
+      }));
+      setPrompt('');
+      addLog(`TRÌNH_BIÊN_DỊCH: Đã biên dịch ${complexity} tokens. Băng thông nút: ${realThroughput} tok/s.`, 'THÀNH_CÔNG', 'PHÂN_XƯỞNG_AI');
     } catch (err) {
-      addLog('COMPILER: Neural link failure.', 'ERROR', 'SYSTEM');
+      addLog('TRÌNH_BIÊN_DỊCH: Vòng lặp phản hồi thần kinh thất bại. Ma trận bị hỏng.', 'LỖI', 'HỆ_THỐNG');
     } finally {
       setIsGenerating(false);
     }
@@ -359,7 +814,7 @@ export default function App() {
 
   const handleCopy = (id: string, code: string) => {
     navigator.clipboard.writeText(code);
-    addLog(`BUFFER: Segment [${id}] transferred to neural clipboard.`, 'INFO');
+    addLog(`BỘ_ĐỆM: Phân đoạn [${id}] đã được chuyển vào khay nhớ tạm thần kinh.`, 'THÔNG_TIN');
   };
 
   return (
@@ -367,15 +822,18 @@ export default function App() {
       {/* Autonomous OS Status Strip */}
       <div className="bg-brand-primary/5 h-8 border-b border-white/5 flex items-center justify-between px-4 md:px-8 shrink-0 overflow-hidden backdrop-blur-2xl">
         <div className="flex gap-4 md:gap-8 overflow-x-auto no-scrollbar whitespace-nowrap">
-          <KernelStatus label="BRAIN" val="AUTONOMOUS-V6" color="text-brand-primary" />
-          <KernelStatus label="NEURAL-LINK" val="FEDERATED" color="text-cyan-400" />
-          <KernelStatus label="EVOLUTION" val={`${session.learningProgress}%`} color="text-indigo-400" className="hidden sm:flex" />
+          <KernelStatus label="BỘ_NÃO" val="TỰ_HÀNH-V6.5" color="text-brand-primary" />
+          <KernelStatus label="LIÊN_KẾT" val="LIÊN_BANG" color="text-cyan-400" />
+          <KernelStatus label="CPU" val={`${(session.cpuLoad ?? 0).toFixed(0)}%`} color={(session.cpuLoad ?? 0) > 70 ? 'text-red-500' : 'text-indigo-400'} className="hidden md:flex" />
+          <KernelStatus label="NHIỆT" val={`${(session.temp ?? 0).toFixed(1)}°C`} color={(session.temp ?? 0) > 75 ? 'text-orange-500' : 'text-emerald-400'} className="hidden lg:flex" />
+          <KernelStatus label="TRỄ" val={`${(session.latency ?? 0).toFixed(0)}ms`} color="text-yellow-500" className="hidden lg:flex" />
+          <KernelStatus label="VRAM" val={`${(session.vramLoad ?? 0).toFixed(1)}%`} color={(session.vramLoad ?? 0) > 85 ? 'text-red-500' : 'text-emerald-400'} />
         </div>
         <div className="flex items-center gap-4 shrink-0">
           {session.predictiveAlert && (
             <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex items-center gap-2 px-2 py-0.5 bg-red-500/10 rounded border border-red-500/20">
                <span className="w-1.5 h-1.5 bg-red-500 rounded-full animate-ping" />
-               <span className="text-[8px] font-black text-red-500 uppercase tracking-tighter">PREDICT_COLLAPSE</span>
+               <span className="text-[8px] font-black text-red-500 uppercase tracking-tighter">DỰ_BÁO_SỤP_ĐỔ</span>
             </motion.div>
           )}
           <div className="text-[9px] font-mono font-black text-slate-800 tracking-[0.5em] uppercase hidden sm:block">Brain v6</div>
@@ -389,22 +847,22 @@ export default function App() {
             <Command className="w-5 h-5 md:w-8 md:h-8 text-black group-hover:rotate-12 transition-transform" />
           </div>
           <div>
-            <h1 className="text-xl md:text-3xl font-black tracking-tighter text-white italic leading-none">AUTO<span className="text-brand-primary">OS</span></h1>
+            <h1 className="text-xl md:text-3xl font-black tracking-tighter text-white italic leading-none">ELITE<span className="text-brand-primary">OS</span></h1>
             <div className="flex gap-2 md:gap-4 mt-1 md:mt-2">
-              <span className={`text-[8px] md:text-[9px] font-black uppercase tracking-widest px-1.5 md:px-2.5 py-0.5 md:py-1 rounded border transition-colors ${session.status === 'connected' ? 'bg-brand-primary/10 text-brand-primary border-brand-primary/30' : 'bg-slate-500/10 text-slate-500 border-white/5'}`}>
+              <span className={`text-[8px] md:text-[9px] font-black uppercase tracking-widest px-1.5 md:px-2.5 py-0.5 md:py-1 rounded border transition-colors ${session.status === 'đã kết nối' ? 'bg-brand-primary/10 text-brand-primary border-brand-primary/30' : 'bg-slate-500/10 text-slate-500 border-white/5'}`}>
                 {session.status}
               </span>
-              <span className="text-[8px] md:text-[9px] font-mono text-slate-600 tracking-widest hidden sm:inline">REL_6-AUTO</span>
+              <span className="text-[8px] md:text-[9px] font-mono text-slate-600 tracking-widest hidden sm:inline">REL_6-TỰ_HÀNH</span>
             </div>
           </div>
         </div>
 
         <div className="hidden xl:flex gap-12 items-center">
-           <MetricPill label="Logic Convergence" val={`${session.learningProgress}%`} sub="Brain Maturity" />
+           <MetricPill label="Hội tụ Logic" val={`${session.learningProgress}%`} sub="Độ chín bộ não" />
            <div className="w-[1px] h-10 bg-white/5" />
-           <MetricPill label="Node Mesh" val={queue.filter(j => j.status === 'RUNNING').length.toString()} sub="Active Streams" />
+           <MetricPill label="Lưới nút" val={queue.filter(j => j.status === 'ĐANG_CHẠY').length.toString()} sub="Luồng hoạt động" />
            <div className="w-[1px] h-10 bg-white/5" />
-           <MetricPill label="Next Decision" val="T-MINS" sub="Neural Context" />
+           <MetricPill label="Quyết định tiếp" val="T-GIÂY" sub="Ngữ cảnh thần kinh" />
         </div>
       </header>
 
@@ -417,10 +875,15 @@ export default function App() {
               <section className="lg:col-span-8 space-y-6 md:space-y-8">
                  <div className="flex items-center justify-between px-2 md:px-0">
                     <h3 className="text-[9px] md:text-[11px] font-black uppercase text-slate-600 tracking-[0.2em] md:tracking-[0.4em] flex items-center gap-2 md:gap-3">
-                      <Activity className="w-4 h-4 md:w-6 md:h-6 text-brand-primary" /> WORKLOAD MATRIX
+                      <Activity className="w-4 h-4 md:w-6 md:h-6 text-brand-primary" /> MA TRẬN CÔNG VIỆC
                     </h3>
                     <div className="flex gap-4">
-                       <span className="text-[8px] md:text-[9px] font-black text-slate-800 uppercase italic">Learning: Active</span>
+                       <button 
+                         onClick={() => createJob(`Luồng xử lý ${Math.floor(Math.random() * 1000)}`, Math.floor(Math.random() * 24) + 4, 'CAO')}
+                         className="text-[8px] md:text-[9px] font-black text-brand-primary uppercase italic hover:text-white transition-colors flex items-center gap-2"
+                       >
+                         <Plus className="w-3 h-3" /> ĐĂNG_KÝ_NÚT
+                       </button>
                     </div>
                  </div>
 
@@ -432,9 +895,9 @@ export default function App() {
                         dragConstraints={{ left: -150, right: 150 }}
                         dragElastic={0.2}
                         onDragEnd={(_, info) => {
-                          if (info.offset.x > 80 && (job.status === 'QUEUED' || job.status === 'FAILURE')) {
+                          if (info.offset.x > 80 && (job.status === 'QUEUED' || job.status === 'FAILURE' || job.status === 'SUCCESS')) {
                             handleGuardedSwipe(job, 'RIGHT');
-                          } else if (info.offset.x < -80 && job.status === 'RUNNING') {
+                          } else if (info.offset.x < -80 && (job.status === 'RUNNING' || job.status === 'SUCCESS' || job.status === 'FAILURE' || job.status === 'QUEUED')) {
                             handleGuardedSwipe(job, 'LEFT');
                           }
                         }}
@@ -442,7 +905,7 @@ export default function App() {
                       >
                          {pendingActions[job.id] && (
                            <div className="absolute inset-0 bg-orange-500/10 flex items-center justify-center backdrop-blur-sm z-10">
-                              <span className="text-[10px] font-black text-white italic animate-pulse">PENDING_TERMINATION...</span>
+                              <span className="text-[10px] font-black text-white italic animate-pulse">ĐANG_CHỜ_CHẤM_DỨT...</span>
                            </div>
                          )}
                          <div className="absolute top-0 right-0 h-full w-1 flex items-center justify-center bg-red-500/10 opacity-0 group-drag:opacity-100 transition-opacity">
@@ -461,25 +924,27 @@ export default function App() {
                             <div className="flex-1">
                                <div className="text-lg md:text-2xl font-black text-white italic tracking-tighter mb-1 md:mb-2 group-hover:text-brand-primary transition-colors">{job.name}</div>
                                <div className="flex flex-wrap items-center gap-2 md:gap-5 text-[8px] md:text-[10px] font-mono text-slate-700 uppercase tracking-widest font-black">
-                                  <span>{job.id}</span>
+                                  <span>ID: {job.id}</span>
                                   <span className="hidden sm:block w-1 md:w-1.5 h-1 md:h-1.5 bg-white/10 rounded-full" />
-                                  <span className={job.executor !== 'PENDING' ? 'text-indigo-400' : ''}>{job.executor === 'PENDING' ? 'MAPPING...' : `${job.executor}`}</span>
+                                  <span className={job.executor !== 'ĐANG_CHỜ' ? 'text-indigo-400' : ''}>
+                                    {job.executor === 'ĐANG_CHỜ' ? (job.waitTicks && job.waitTicks > 3 ? `ĐANG_ĐÓI [${job.waitTicks}t]` : 'ĐANG_ÁNH_XẠ...') : `${job.executor} [${job.metrics?.nodeId || 'N/A'}]`}
+                                  </span>
                                   <span className="hidden sm:block w-1 md:w-1.5 h-1 md:h-1.5 bg-white/10 rounded-full" />
-                                  <span className="text-brand-primary">{job.estCost}</span>
+                                  <span className="text-brand-primary">{job.metrics?.tokens ? `${job.metrics.tokens} TOK` : `${job.cost || '??'} RU`}</span>
                                </div>
                             </div>
                          </div>
                          <div className="flex items-center justify-between md:justify-end gap-6 md:gap-12 w-full md:w-auto pt-6 md:pt-0 border-t md:border-t-0 border-white/5">
                             <div className="text-left md:text-right">
-                               <div className={`text-[10px] md:text-[11px] font-black uppercase tracking-widest ${job.status === 'SUCCESS' ? 'text-emerald-500' : job.status === 'RUNNING' || job.status === 'ROUTING' ? 'text-brand-primary' : 'text-slate-700'}`}>{job.status}</div>
+                               <div className={`text-[10px] md:text-[11px] font-black uppercase tracking-widest ${job.status === 'THÀNH_CÔNG' ? 'text-emerald-500' : job.status === 'ĐANG_CHẠY' || job.status === 'ĐANG_ĐIỀU_PHỐI' ? 'text-brand-primary' : 'text-slate-700'}`}>{job.status.replace('_', ' ')}</div>
                                <div className="text-[8px] md:text-[9px] font-black text-slate-800 uppercase italic mt-1 md:mt-1.5">{job.requirements.vram} GB VRAM</div>
                             </div>
                             <button 
-                              onClick={() => routeJob(job.id)}
-                              disabled={job.status !== 'QUEUED' && job.status !== 'FAILURE'}
+                              onClick={() => handlePipeline(job.id)}
+                              disabled={job.status !== 'XẾP_HÀNG' && job.status !== 'LỖI'}
                               className="flex-1 md:flex-none w-auto md:w-40 py-4 md:py-5 bg-white/5 hover:bg-white text-slate-500 hover:text-black rounded-xl md:rounded-2xl font-black text-[10px] md:text-[11px] uppercase tracking-[0.2em] md:tracking-[0.3em] transition-all disabled:opacity-20 shadow-2xl border border-white/5"
                             >
-                              START
+                              BẮT ĐẦU
                             </button>
                          </div>
                       </motion.div>
@@ -490,9 +955,9 @@ export default function App() {
                  <div className="space-y-4 md:space-y-6">
                     <div className="flex justify-between items-center px-2 md:px-4">
                        <h3 className="text-[9px] md:text-[11px] font-black uppercase text-slate-600 tracking-[0.2em] md:tracking-[0.4em] flex items-center gap-2 md:gap-3">
-                        <TerminalIcon className="w-4 h-4 md:w-6 md:h-6 text-brand-primary" /> STREAM LOG
+                        <TerminalIcon className="w-4 h-4 md:w-6 md:h-6 text-brand-primary" /> NHẬT KÝ HỆ THỐNG
                       </h3>
-                      <button onClick={() => setLogs([])} className="text-[8px] md:text-[9px] font-black uppercase text-slate-800 hover:text-white transition-colors tracking-widest">WIPE</button>
+                      <button onClick={() => setLogs([])} className="text-[8px] md:text-[9px] font-black uppercase text-slate-800 hover:text-white transition-colors tracking-widest">XÓA</button>
                     </div>
                     <div className="bg-black border-2 border-white/5 rounded-3xl md:rounded-[4.5rem] p-6 md:p-12 font-mono text-[10px] md:text-[12px] h-[350px] md:h-[480px] overflow-y-auto shadow-4xl relative group ring-1 ring-white/5">
                       <div className="sticky top-0 right-0 float-right text-[8px] md:text-[10px] bg-black/80 px-2 py-1 border border-white/10 rounded-lg md:rounded-xl text-brand-primary font-black z-10">FLOW-PRO</div>
@@ -524,19 +989,20 @@ export default function App() {
               {/* Neural Integrity Dashboard */}
               <aside className="lg:col-span-4 space-y-6 md:space-y-10">
                  <h3 className="text-[9px] md:text-[11px] font-black uppercase text-slate-600 tracking-[0.2em] md:tracking-[0.4em] flex items-center gap-2 md:gap-3 px-2 md:px-0">
-                  <Shield className="w-4 h-4 md:w-5 md:h-5 text-emerald-500" /> INTEGRITY PANEL
+                  <Shield className="w-4 h-4 md:w-5 md:h-5 text-emerald-500" /> BẢNG HỆ THỐNG
                 </h3>
                 <div className="glass-panel p-6 md:p-12 rounded-[2.5rem] md:rounded-[4.5rem] border-white/5 space-y-8 md:space-y-12 bg-gradient-to-b from-white/[0.05] to-transparent shadow-4xl relative overflow-hidden">
                    <div className="absolute -bottom-20 -right-20 w-40 h-40 bg-brand-primary/10 rounded-full blur-3xl" />
                    
                    <div className="grid grid-cols-1 gap-4 md:gap-8">
-                      <StateRow label="Executor" val="AUTO" color="text-brand-primary" />
-                      <StateRow label="Decision" val="REINFORCED" color="text-indigo-400" />
-                      <StateRow label="Mesh" val="99.9%" color="text-emerald-500" />
+                      <StateRow label="TẢI VRAM" val={`${(session.vramLoad ?? 0).toFixed(1)}%`} color={(session.vramLoad ?? 0) > 80 ? 'text-red-500' : 'text-emerald-500'} />
+                      <StateRow label="TÍNH TOÁN CPU" val={`${(session.cpuLoad ?? 0).toFixed(0)}%`} color={(session.cpuLoad ?? 0) > 85 ? 'text-orange-500' : 'text-brand-primary'} />
+                      <StateRow label="NHIỆT ĐỘ" val={`${(session.temp ?? 0).toFixed(1)}°C`} color={(session.temp ?? 0) > 80 ? 'text-red-500' : 'text-indigo-400'} />
+                      <StateRow label="ĐỘ TRỄ MẠNG" val={`${(session.latency ?? 0).toFixed(0)}ms`} color="text-emerald-500" />
                    </div>
 
                    <div className="pt-6 md:pt-12 border-t border-white/10 space-y-6 md:space-y-10">
-                      <label className="text-[9px] md:text-[11px] font-black uppercase tracking-[0.2em] md:tracking-[0.3em] text-slate-700 block">CHECKPOINTS</label>
+                      <label className="text-[9px] md:text-[11px] font-black uppercase tracking-[0.2em] md:tracking-[0.3em] text-slate-700 block">ĐIỂM KIỂM SOÁT</label>
                       <div className="space-y-5 md:space-y-7">
                         {checkpoints.map(cp => (
                           <div key={cp.id} className="flex items-center gap-4 md:gap-7 group cursor-pointer hover:translate-x-2 transition-transform">
@@ -554,12 +1020,12 @@ export default function App() {
                    </div>
 
                    <div className="pt-6 md:pt-12 border-t border-white/10 space-y-6 md:space-y-10">
-                      <MetricBar label="Convergence" percentage={session.learningProgress} color="bg-indigo-500 shadow-indigo-500/20" />
-                      <MetricBar label="Throughput" percentage={88} color="bg-brand-primary" />
+                      <MetricBar label="Hội tụ" percentage={session.learningProgress} color="bg-indigo-500 shadow-indigo-500/20" />
+                      <MetricBar label="Băng thông" percentage={88} color="bg-brand-primary" />
                    </div>
 
-                   <button onClick={() => addLog('PERSISTENCE: Snapshotting global brain state...', 'BRAIN')} className="w-full py-5 md:py-7 bg-brand-primary text-black font-black uppercase text-[11px] md:text-[13px] tracking-[0.2em] md:tracking-[0.4em] rounded-2xl md:rounded-[2rem] shadow-5xl shadow-brand-primary/40 hover:scale-[1.02] active:scale-95 transition-all">
-                     SYNC PERSISTENCE
+                   <button onClick={() => addLog('BỀN_VỮNG: Đang chụp nhanh trạng thái bộ não toàn cầu...', 'BỘ_NÃO')} className="w-full py-5 md:py-7 bg-brand-primary text-black font-black uppercase text-[11px] md:text-[13px] tracking-[0.2em] md:tracking-[0.4em] rounded-2xl md:rounded-[2rem] shadow-5xl shadow-brand-primary/40 hover:scale-[1.02] active:scale-95 transition-all">
+                     ĐỒNG BỘ BỀN VỮNG
                    </button>
                 </div>
               </aside>
@@ -572,14 +1038,14 @@ export default function App() {
                   <div className="absolute -top-40 -left-40 w-[300px] md:w-[500px] h-[300px] md:h-[500px] bg-brand-primary/5 rounded-full blur-[80px] md:blur-[100px]" />
                   <div className="relative z-10 text-center">
                      <Sparkles className="w-12 h-12 md:w-20 md:h-20 text-brand-primary mx-auto mb-8 md:mb-12 animate-pulse" />
-                     <h2 className="text-3xl md:text-6xl font-black text-white italic tracking-tighter mb-4 md:mb-6 leading-none uppercase">PIPELINE FORGE</h2>
-                     <p className="text-slate-600 text-[9px] md:text-[11px] mb-8 md:mb-16 leading-relaxed font-black uppercase tracking-[0.3em] md:tracking-[0.5em] max-w-2xl mx-auto italic">Hardened & Isolated Orchestration Logic</p>
+                     <h2 className="text-3xl md:text-6xl font-black text-white italic tracking-tighter mb-4 md:mb-6 leading-none uppercase">LÒ TỔNG HỢP PIPELINE</h2>
+                     <p className="text-slate-600 text-[9px] md:text-[11px] mb-8 md:mb-16 leading-relaxed font-black uppercase tracking-[0.3em] md:tracking-[0.5em] max-w-2xl mx-auto italic">Logic Điều phối Cô lập & Bảo mật</p>
                      
                      <div className="relative group mb-8 md:mb-12">
                         <textarea 
                           value={prompt}
                           onChange={(e) => setPrompt(e.target.value)}
-                          placeholder="Mission intent..."
+                          placeholder="Ý định mục tiêu..."
                           className="w-full bg-black/80 border-2 border-white/5 rounded-3xl md:rounded-[4rem] p-8 md:p-16 text-white focus:border-brand-primary/30 outline-none transition-all placeholder:text-slate-900 text-sm md:text-base min-h-[250px] md:min-h-[350px] shadow-4xl ring-1 ring-white/10"
                         />
                         <button 
@@ -588,7 +1054,7 @@ export default function App() {
                           className="w-full md:w-auto mt-4 md:absolute md:bottom-12 md:right-12 bg-brand-primary px-8 md:px-16 py-4 md:py-6 rounded-2xl md:rounded-full font-black text-[12px] md:text-[14px] uppercase tracking-widest text-black flex items-center justify-center gap-4 md:gap-5 shadow-4xl shadow-brand-primary/40 hover:bg-white transition-all disabled:opacity-50 active:scale-90"
                         >
                           {isGenerating ? <RotateCw className="w-5 h-5 md:w-7 md:h-7 animate-spin" /> : <Zap className="w-5 h-5 md:w-7 md:h-7" />}
-                          {isGenerating ? 'Compiling...' : 'Build Pipeline'}
+                          {isGenerating ? 'Đang tổng hợp...' : 'KHỞI CHẠY PIPELINE'}
                         </button>
                      </div>
 
@@ -613,8 +1079,8 @@ export default function App() {
           {activeTab === 'library' && (
             <motion.div key="library" initial={{ opacity: 0, x: 40 }} animate={{ opacity: 1, x: 0 }} className="space-y-8 md:space-y-12">
                <div className="flex flex-col md:flex-row md:items-center justify-between px-4 md:px-8 gap-4">
-                  <h2 className="text-3xl md:text-5xl font-black italic text-white tracking-[0.2em] md:tracking-[0.3em] uppercase">Modules</h2>
-                  <div className="bg-white/5 px-6 md:px-8 py-2 md:py-3 rounded-full text-[10px] md:text-[12px] font-black text-slate-700 uppercase tracking-widest border border-white/5 shadow-inner self-start md:self-auto">V6-BRAIN</div>
+                  <h2 className="text-3xl md:text-5xl font-black italic text-white tracking-[0.2em] md:tracking-[0.3em] uppercase">Thư viện Module</h2>
+                  <div className="bg-white/5 px-6 md:px-8 py-2 md:py-3 rounded-full text-[10px] md:text-[12px] font-black text-slate-700 uppercase tracking-widest border border-white/5 shadow-inner self-start md:self-auto">BỘ_NÃO-V6.5</div>
                </div>
 
                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 md:gap-10">
@@ -649,23 +1115,41 @@ export default function App() {
                   <div className="w-20 h-20 md:w-32 md:h-32 bg-white/5 rounded-[2.5rem] md:rounded-[3.5rem] flex items-center justify-center mx-auto mb-12 md:mb-16 shadow-2xl border border-white/[0.02]">
                      <Settings className="w-10 h-10 md:w-16 md:h-16 text-slate-800" />
                   </div>
-                  <h2 className="text-3xl md:text-5xl font-black text-white italic mb-4 md:mb-6 tracking-tighter leading-none">PARAMETERS</h2>
-                  <p className="text-[10px] text-brand-primary/60 uppercase tracking-[0.4em] md:tracking-[0.6em] font-black mb-16 md:mb-24 italic">Control Protocol v6</p>
+                  <h2 className="text-3xl md:text-5xl font-black text-white italic mb-4 md:mb-6 tracking-tighter leading-none">THAM SỐ HỆ THỐNG</h2>
+                  <p className="text-[10px] text-brand-primary/60 uppercase tracking-[0.4em] md:tracking-[0.6em] font-black mb-16 md:mb-24 italic">Giao thức Điều khiển v6.5</p>
                   
                   <div className="grid gap-6 md:gap-10 text-left">
-                     <KernelToggle label="Adaptive Isolation" defaultEnabled />
-                     <KernelToggle label="Predictive Resource" defaultEnabled />
-                     <KernelToggle label="State Checkpointing" defaultEnabled />
-                     <KernelToggle label="Neural Migration" />
+                     <KernelToggle label="Cô lập thích ứng" defaultEnabled />
+                     <KernelToggle label="Tài nguyên dự báo" defaultEnabled />
+                     <KernelToggle label="Điểm kiểm soát trạng thái" defaultEnabled />
+                     <KernelToggle label="Di cư mạng thần kinh" />
+                     
+                     <div className="mt-8 pt-8 border-t border-white/5">
+                        <div className="flex justify-between items-center mb-4">
+                           <span className="text-[10px] font-black uppercase text-slate-500 tracking-widest">Hồi phục Bộ điều tốc</span>
+                           <span className="text-[10px] font-mono text-brand-primary">{(recoveryRamp * 100).toFixed(0)}%</span>
+                        </div>
+                        <div className="h-1 bg-white/5 rounded-full overflow-hidden">
+                           <motion.div 
+                              animate={{ width: `${recoveryRamp * 100}%` }}
+                              className={`h-full ${recoveryRamp < 1 ? 'bg-orange-500' : 'bg-brand-primary'}`}
+                           />
+                        </div>
+                     </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-12 md:mt-20">
+                     <button onClick={optimizeKernel} className="py-6 bg-white/5 border border-white/10 rounded-3xl text-[11px] font-black uppercase tracking-widest text-slate-400 hover:bg-brand-primary hover:text-black transition-all">Tối ưu hóa Nhân</button>
+                     <button onClick={flushCache} className="py-6 bg-white/5 border border-white/10 rounded-3xl text-[11px] font-black uppercase tracking-widest text-slate-400 hover:bg-orange-500 hover:text-black transition-all">Xóa Bộ nhớ đệm Thần kinh</button>
                   </div>
                </div>
 
                <div className="p-8 md:p-14 border-2 border-red-500/20 rounded-[3rem] md:rounded-[5rem] bg-red-500/5 flex flex-col md:flex-row items-center justify-between group overflow-hidden relative backdrop-blur-3xl shadow-4xl gap-8">
                   <div className="relative z-10 text-center md:text-left">
-                     <h4 className="text-red-500 font-black text-2xl md:text-3xl italic tracking-tighter leading-none mb-3 md:mb-4 uppercase tracking-widest">Nuke Override</h4>
-                     <p className="text-[10px] md:text-[12px] text-red-500/50 font-black uppercase tracking-[0.3em] font-mono">Session & Node Purge</p>
+                     <h4 className="text-red-500 font-black text-2xl md:text-3xl italic tracking-tighter leading-none mb-3 md:mb-4 uppercase tracking-widest">Ghi đè Hủy diệt</h4>
+                     <p className="text-[10px] md:text-[12px] text-red-500/50 font-black uppercase tracking-[0.3em] font-mono">Dọn sạch Phiên & Nút</p>
                   </div>
-                  <button className="w-full md:w-auto px-12 md:px-16 py-4 md:py-6 bg-red-500 text-white font-black text-[12px] md:text-[14px] uppercase tracking-widest rounded-2xl md:rounded-[2rem] shadow-4xl shadow-red-500/40 hover:bg-white hover:text-black transition-all relative z-10 active:scale-90">TERMINATE</button>
+                  <button onClick={nukeSession} className="w-full md:w-auto px-12 md:px-16 py-4 md:py-6 bg-red-500 text-white font-black text-[12px] md:text-[14px] uppercase tracking-widest rounded-2xl md:rounded-[2rem] shadow-4xl shadow-red-500/40 hover:bg-white hover:text-black transition-all relative z-10 active:scale-90">HỦY DIỆT</button>
                   <div className="absolute top-0 right-0 p-16 opacity-10 blur-xl">
                      <Shield className="w-48 h-48 text-red-500" />
                   </div>
@@ -677,10 +1161,10 @@ export default function App() {
 
       {/* Autonomous Navigation Deck */}
       <footer className="fixed bottom-6 md:bottom-14 left-1/2 -translate-x-1/2 w-[92%] md:w-[95%] max-w-3xl h-20 md:h-28 glass-panel border border-white/10 rounded-3xl md:rounded-[5rem] flex items-center justify-around px-4 md:px-12 z-50 shadow-5xl backdrop-blur-3xl ring-2 ring-white/5">
-         <NavDeckIcon active={activeTab === 'hub'} onClick={() => setActiveTab('hub')} icon={<Monitor className="w-6 h-6 md:w-10 md:h-10" />} label="Hub" />
-         <NavDeckIcon active={activeTab === 'forge'} onClick={() => setActiveTab('forge')} icon={<Sparkles className="w-6 h-6 md:w-10 md:h-10" />} label="Forge" />
-         <NavDeckIcon active={activeTab === 'library'} onClick={() => setActiveTab('library')} icon={<Code2 className="w-6 h-6 md:w-10 md:h-10" />} label="Modules" />
-         <NavDeckIcon active={activeTab === 'system'} onClick={() => setActiveTab('system')} icon={<Settings className="w-6 h-6 md:w-10 md:h-10" />} label="Sys" />
+         <NavDeckIcon active={activeTab === 'hub'} onClick={() => setActiveTab('hub')} icon={<Monitor className="w-6 h-6 md:w-10 md:h-10" />} label="Trung tâm" />
+         <NavDeckIcon active={activeTab === 'forge'} onClick={() => setActiveTab('forge')} icon={<Sparkles className="w-6 h-6 md:w-10 md:h-10" />} label="Lò AI" />
+         <NavDeckIcon active={activeTab === 'library'} onClick={() => setActiveTab('library')} icon={<Code2 className="w-6 h-6 md:w-10 md:h-10" />} label="Thư viện" />
+         <NavDeckIcon active={activeTab === 'system'} onClick={() => setActiveTab('system')} icon={<Settings className="w-6 h-6 md:w-10 md:h-10" />} label="Hệ thống" />
       </footer>
 
       {/* Floating Orbital Command FAB (Mobile Exclusive Context) */}
@@ -699,9 +1183,9 @@ export default function App() {
         <AnimatePresence>
           {showOrbital && (
             <div className="absolute bottom-20 right-0 flex flex-col gap-4">
-              <OrbitalAction icon={<Zap />} label="Run Critical" color="bg-red-500" onClick={() => addLog('AUTONOMOUS: High priority routine initiated via FAB.', 'BRAIN')} />
-              <OrbitalAction icon={<RefreshCwIcon className="w-5 h-5" />} label="Resync All" color="bg-indigo-500" onClick={() => addLog('SYNC: Federated nodes resyncing...', 'INFO')} />
-              <OrbitalAction icon={<Shield />} label="Hard Isolate" color="bg-emerald-500" onClick={() => addLog('SYSTEM: Forcing hardware isolation...', 'WARN')} />
+              <OrbitalAction icon={<Zap />} label="Chạy Khẩn cấp" color="bg-red-500" onClick={() => addLog('TỰ_HÀNH: Quy trình ưu tiên cao đã bắt đầu qua FAB.', 'BỘ_NÃO')} />
+              <OrbitalAction icon={<RefreshCwIcon className="w-5 h-5" />} label="Đồng bộ lại tất cả" color="bg-indigo-500" onClick={() => addLog('ĐỒNG_BỘ: Đang đồng bộ lại các nút liên bang...', 'THÔNG_TIN')} />
+              <OrbitalAction icon={<Shield />} label="Cô lập Cứng" color="bg-emerald-500" onClick={() => addLog('HỆ_THỐNG: Đang cưỡng bức cô lập phần cứng...', 'CẢNH_BÁO')} />
             </div>
           )}
         </AnimatePresence>
