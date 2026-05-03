@@ -1,0 +1,6 @@
+{
+  "name": "Elite OS v6.0: Autonomous AI Brain",
+  "description": "A self-optimizing, distributed AI operating system. Featuring autonomous workload routing, adaptive training parallelism, and real-time state streaming across Colab and Federated Runtimes.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["Autonomous Workload Routing", "Self-Optimizing Scheduler", "Live State Streaming", "Adaptive Multi-Node Training"]
+}
