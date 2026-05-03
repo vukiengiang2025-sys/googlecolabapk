@@ -40,17 +40,13 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.2'
-          validate-wrappers: true
+          gradle-version: '8.14.3'
+          validate-wrappers: false
 
       - name: Build APK (Debug)
         run: |
           cd android
-          # Đảm bảo permissions cho gradlew mặc dù đã có gradle cài sẵn
-          chmod +x gradlew
-          # Sử dụng gradle hệ thống nếu gradlew vẫn lỗi, 
-          # nhưng ưu tiên ./gradlew để giữ tính nhất quán của project
-          ./gradlew assembleDebug --stacktrace
+          gradle assembleDebug --stacktrace
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
